@@ -1549,6 +1549,37 @@ function setPage(page){
 /* ============================================================
    HELPERS DE FORMATAÇÃO
    ============================================================ */
+/* Renderiza badge de variação % entre valor atual e anterior
+   Retorna HTML inline — verde se cresceu, vermelho se caiu.
+   invertColor=true para despesas (queda é bom) */
+function renderVariation(current, prev, invertColor = false){
+  if (!prev || prev === 0) return '';
+  const pct = ((current - prev) / Math.abs(prev)) * 100;
+  const up  = pct >= 0;
+  const good = invertColor ? !up : up;
+  const color = good ? 'var(--pj)' : 'var(--danger)';
+  const arrow = up ? '▲' : '▼';
+  return `<span style="font-size:11px; color:${color}; font-weight:600; margin-left:4px;">${arrow} ${Math.abs(pct).toFixed(1)}%</span>`;
+}
+
+/* Calcula mês anterior e mesmo mês do ano anterior a partir de { year, month } */
+function getPrevPeriods(year, month){
+  if (!month) return { prevMonth: null, prevYear: null };
+  const pm = month === 1 ? 12 : month - 1;
+  const py = month === 1 ? year - 1 : year;
+  return {
+    prevMonth: { year: py, month: pm },
+    prevYear:  { year: year - 1, month }
+  };
+}
+
+/* Filtra transações de um período específico { year, month } */
+function txsForPeriod(txs, period){
+  if (!period) return [];
+  const key = `${period.year}-${String(period.month).padStart(2,'0')}`;
+  return txs.filter(t => t.date_competencia?.startsWith(key));
+}
+
 function formatMoney(v){
   const n = Number(v) || 0;
   return n.toLocaleString('pt-BR', { style:'currency', currency:'BRL' });
@@ -1860,17 +1891,38 @@ function renderGrupoDashboard(){
       <span style="font-size:12px; color:var(--text-faint); margin-left:4px;">${periodoLabel} · Regime Caixa</span>
     </div>
 
+    <!-- KPIs: busca período anterior para comparativo (só quando mês específico) -->
+    ${(() => { window._grpPrevData = null; if (month) {
+      const { prevMonth: pm, prevYear: py } = getPrevPeriods(year, month);
+      const prevMonthKey = pm ? `${pm.year}-${String(pm.month).padStart(2,'0')}` : null;
+      const prevYearKey  = py ? `${py.year}-${String(py.month).padStart(2,'0')}` : null;
+      const pmSummary = prevMonthKey ? summary.map(x => ({
+        fat: x.byMonth?.[prevMonthKey]?.faturamento || 0,
+        rec: x.byMonth?.[prevMonthKey]?.receita     || 0,
+      })) : null;
+      window._grpPrevData = { prevMonthKey, prevYearKey, pmSummary };
+    } return ''; })()}
+
+    ${(()=>{
+      const gp = window._grpPrevData;
+      const pmFat = gp?.pmSummary ? gp.pmSummary.reduce((s,x)=>s+x.fat,0) : null;
+      const pmRec = gp?.pmSummary ? gp.pmSummary.reduce((s,x)=>s+x.rec,0) : null;
+      const vb = (cur, pm, invert=false) => pm !== null && pm !== undefined
+        ? `<div style="font-size:10.5px; color:var(--text-faint); margin-top:2px;">vs mês ant.: ${renderVariation(cur,pm,invert)}</div>` : '';
+      return `
     <!-- KPIs LINHA 1 -->
     <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-bottom:12px;">
       <div class="kpi-card" style="border-top:3px solid #2952A3;">
         <div class="kpi-label">Faturamento Total do Grupo</div>
         <div class="kpi-value positive">${formatMoney(totalFat)}</div>
         <div class="kpi-sub">vendas fechadas · competência</div>
+        ${vb(totalFat, pmFat)}
       </div>
       <div class="kpi-card" style="border-top:3px solid var(--pj);">
         <div class="kpi-label">Receita Total do Grupo</div>
         <div class="kpi-value positive">${formatMoney(totalRec)}</div>
         <div class="kpi-sub">efetivamente recebido · caixa</div>
+        ${vb(totalRec, pmRec)}
       </div>
       <div class="kpi-card" style="border-top:3px solid var(--warn);">
         <div class="kpi-label">Saldo Consolidado</div>
@@ -1896,7 +1948,8 @@ function renderGrupoDashboard(){
         <div class="kpi-value ${totalRL>=0?'positive':'negative'}">${formatMoney(totalRL)}</div>
         <div class="kpi-sub">${pct(totalRL, totalRec)} sobre receita · caixa</div>
       </div>
-    </div>
+    </div>`;
+    })()}
 
     <!-- GRÁFICOS DE PIZZA -->
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:20px;">
@@ -2294,18 +2347,43 @@ function renderVisaoCompetencia(){
   const faturamentoTotal = fechadas.reduce((s,v) => s + Number(v.total_amount), 0);
   const dre = computeCompetenceDRE(faturamentoTotal);
 
+  // Comparativos por mês anterior e mesmo mês ano anterior
+  const { prevMonth, prevYear } = getPrevPeriods(state.period?.year, state.period?.month);
+  const allSales = state.sales;
+
+  const fatForPeriod = (period) => {
+    if (!period) return null;
+    const key = `${period.year}-${String(period.month).padStart(2,'0')}`;
+    return allSales.filter(s => s.status==='fechada' && s.date_competencia?.startsWith(key))
+                   .reduce((s,v) => s + Number(v.total_amount), 0);
+  };
+  const fatPrevMonth = fatForPeriod(prevMonth);
+  const fatPrevYear  = fatForPeriod(prevYear);
+
+  const varBadge = (cur, pm, py, invert=false) => {
+    if (pm === null && py === null) return '';
+    return `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:2px;">
+      ${pm !== null ? `<span style="font-size:10px; color:var(--text-faint);">vs mês ant.: ${renderVariation(cur, pm, invert)}</span>` : ''}
+      ${py !== null ? `<span style="font-size:10px; color:var(--text-faint);">vs ano ant.: ${renderVariation(cur, py, invert)}</span>` : ''}
+    </div>`;
+  };
+
+  const drePM = fatPrevMonth !== null ? computeCompetenceDRE(fatPrevMonth) : null;
+  const drePY = fatPrevYear  !== null ? computeCompetenceDRE(fatPrevYear)  : null;
+
   return `
     ${renderPeriodSelector()}
 
     <div class="bridge-note" style="margin-bottom:16px;">
       <span>ℹ</span>
-      <span>Regime de competência — baseado em vendas fechadas. Custo variável estimado em ${dre.totalCustoVarPct.toFixed(1)}% (Imposto ${dre.taxPct.toFixed(1)}% + Variável ${dre.varPct.toFixed(1)}%). ${dre.nMonths > 1 ? `Custos Operacionais multiplicados por <strong>${dre.nMonths} meses</strong> (${formatMoney(dre.custosFixosMensal)}/mês × ${dre.nMonths}).` : 'Período de 1 mês.'} Ajuste as premissas abaixo.</span>
+      <span>Regime de competência — baseado em vendas fechadas. Custo variável estimado em ${dre.totalCustoVarPct.toFixed(1)}% (Imposto ${dre.taxPct.toFixed(1)}% + Variável ${dre.varPct.toFixed(1)}%). ${dre.nMonths > 1 ? `Custos Operacionais multiplicados por <strong>${dre.nMonths} meses</strong>.` : 'Período de 1 mês.'} Ajuste as premissas abaixo.</span>
     </div>
 
     <div class="kpi-row kpi-row-compact">
       <div class="kpi-compact kpi-card">
         <div class="kpi-label">Faturamento</div>
         <div class="kpi-value positive">${formatMoney(faturamentoTotal)}</div>
+        ${varBadge(faturamentoTotal, fatPrevMonth, fatPrevYear)}
       </div>
       <div class="kpi-compact kpi-card">
         <div class="kpi-label">Custos Operacionais</div>
@@ -2316,11 +2394,13 @@ function renderVisaoCompetencia(){
         <div class="kpi-label">Margem Contrib.</div>
         <div class="kpi-value ${dre.margemContribuicao >= 0 ? 'positive' : 'negative'}">${formatMoney(dre.margemContribuicao)}</div>
         <div class="kpi-sub">${dre.pctMC.toFixed(1)}%</div>
+        ${varBadge(dre.margemContribuicao, drePM?.margemContribuicao ?? null, drePY?.margemContribuicao ?? null)}
       </div>
       <div class="kpi-compact kpi-card">
         <div class="kpi-label">EBIT</div>
         <div class="kpi-value ${dre.ebit >= 0 ? 'positive' : 'negative'}">${formatMoney(dre.ebit)}</div>
         <div class="kpi-sub">${dre.pctEbit.toFixed(1)}%</div>
+        ${varBadge(dre.ebit, drePM?.ebit ?? null, drePY?.ebit ?? null)}
       </div>
       <div class="kpi-compact kpi-card">
         <div class="kpi-label">Ponto de Equilíbrio</div>
@@ -2392,41 +2472,59 @@ function renderVisaoCaixa(){
   const n = window._peMonths || 3;
   const monthlyMC = computeRecentMonthlyMC(n);
   const avgPctMC = monthlyMC.length > 0 ? monthlyMC.reduce((s,m) => s + m.pctMC, 0) / monthlyMC.length : 0;
-  const totalFixedCostsRealizado = dre.despesasOpTotal; // realizado no período filtrado, não o cadastro
+  const totalFixedCostsRealizado = dre.despesasOpTotal;
   const pontoEquilibrioCaixa = avgPctMC > 0 ? totalFixedCostsRealizado / (avgPctMC / 100) : 0;
+
+  // Comparativos — só quando filtro é mês específico
+  const { prevMonth, prevYear } = getPrevPeriods(state.period?.year, state.period?.month);
+  const allTxs = state.transactions;
+  const drePrevMonth = prevMonth ? computeDRE(txsForPeriod(allTxs, prevMonth)) : null;
+  const drePrevYear  = prevYear  ? computeDRE(txsForPeriod(allTxs, prevYear))  : null;
+
+  const varBadge = (cur, pm, py, invert=false) => {
+    if (!pm && !py) return '';
+    return `<div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:2px;">
+      ${pm ? `<span style="font-size:10px; color:var(--text-faint);">vs mês ant.: ${renderVariation(cur, pm, invert)}</span>` : ''}
+      ${py ? `<span style="font-size:10px; color:var(--text-faint);">vs ano ant.: ${renderVariation(cur, py, invert)}</span>` : ''}
+    </div>`;
+  };
 
   return `
     ${renderPeriodSelector()}
 
     <div class="bridge-note" style="margin-bottom:16px;">
       <span>ℹ</span>
-      <span>Regime de caixa — baseado no que já foi efetivamente realizado no fluxo (entradas/saídas pagas), não no que foi vendido. Custos Operacionais aqui são o REALIZADO do período (Despesas com Pessoal + Operacionais), diferente do cadastro fixo usado na Visão Competência.</span>
+      <span>Regime de caixa — baseado no que já foi efetivamente realizado no fluxo (entradas/saídas pagas), não no que foi vendido.</span>
     </div>
 
     <div class="kpi-row kpi-row-compact">
       <div class="kpi-compact kpi-card">
         <div class="kpi-label">Receita</div>
         <div class="kpi-value positive">${formatMoney(dre.receita)}</div>
+        ${varBadge(dre.receita, drePrevMonth?.receita, drePrevYear?.receita)}
       </div>
       <div class="kpi-compact kpi-card">
         <div class="kpi-label">Custos Operacionais</div>
         <div class="kpi-value negative">${formatMoney(dre.despesasOpTotal)}</div>
-        <div class="kpi-sub">realizado no período</div>
+        ${varBadge(dre.despesasOpTotal, drePrevMonth?.despesasOpTotal, drePrevYear?.despesasOpTotal, true)}
       </div>
       <div class="kpi-compact kpi-card">
         <div class="kpi-label">Margem Contrib.</div>
         <div class="kpi-value ${dreCardClass(dre.margemContribuicao)}">${formatMoney(dre.margemContribuicao)}</div>
         <div class="kpi-sub">${dre.pctMC.toFixed(1)}%</div>
+        ${varBadge(dre.margemContribuicao, drePrevMonth?.margemContribuicao, drePrevYear?.margemContribuicao)}
       </div>
       <div class="kpi-compact kpi-card">
         <div class="kpi-label">EBIT (caixa)</div>
         <div class="kpi-value ${dreCardClass(dre.resultadoOperacional)}">${formatMoney(dre.resultadoOperacional)}</div>
         <div class="kpi-sub">${dre.pctResultadoOperacional.toFixed(1)}%</div>
+        ${varBadge(dre.resultadoOperacional, drePrevMonth?.resultadoOperacional, drePrevYear?.resultadoOperacional)}
       </div>
       <div class="kpi-compact kpi-card">
-        <div class="kpi-label">Ponto de Equilíbrio</div>
-        <div class="kpi-value" style="color:var(--warn);">${formatMoney(pontoEquilibrioCaixa)}</div>
-        <div class="kpi-sub">receita mínima necessária</div>
+        <div class="kpi-label">Resultado Líquido</div>
+        <div class="kpi-value ${dreCardClass(dre.resultadoLiquido)}">${formatMoney(dre.resultadoLiquido)}</div>
+        <div class="kpi-sub">${dre.pctResultadoLiquido.toFixed(1)}%</div>
+        ${varBadge(dre.resultadoLiquido, drePrevMonth?.resultadoLiquido, drePrevYear?.resultadoLiquido)}
       </div>
     </div>
 
