@@ -1113,7 +1113,12 @@ const state = {
   selectedTxIds: new Set(),
   loading: false,
   // dados consolidados do grupo (carregados para o dashboard)
-  groupSummary: [],           // [{ entity, faturamento, resultadoLiq, saldo }]
+  groupSummary: [],           // [{ entity, faturamento, resultadoLiq, saldo, dreData }]
+  groupDREData: {},           // { entityId: { groupName: { monthKey: total } } }
+  groupFilter: {              // filtro do dashboard consolidado
+    year: new Date().getFullYear(),
+    month: null,              // null = acumulado do ano, número = mês específico
+  },
 };
 
 function currentEntity(){
@@ -1278,20 +1283,26 @@ async function loadEntities(){
 /* Carrega indicadores resumidos de TODAS as empresas para o dashboard do grupo */
 async function loadGroupSummary(){
   const pjEntities = state.entities.filter(e => e.kind === 'pj');
-  const year = (state.period?.year) || new Date().getFullYear();
-  const startDate = `${year}-01-01`;
-  const endDate = `${year}-12-31`;
+  const { year, month } = state.groupFilter;
+
+  const startDate = month
+    ? `${year}-${String(month).padStart(2,'0')}-01`
+    : `${year}-01-01`;
+  const endDate = month
+    ? `${year}-${String(month).padStart(2,'0')}-31`
+    : `${year}-12-31`;
 
   const summaries = await Promise.all(pjEntities.map(async entity => {
     const [
-      { data: txsYear },   // transações do ano (para DRE e saldo)
-      { data: txsAll },    // todas as transações realizadas (para saldo real)
-      { data: sales },     // vendas do ano
-      { data: accounts }   // contas
+      { data: txsYear },
+      { data: txsAll },
+      { data: sales },
+      { data: accounts }
     ] = await Promise.all([
       supabaseClient.from('transactions')
         .select('amount, flow_type, status, date_competencia, categories(name, groups(name))')
         .eq('entity_id', entity.id)
+        .eq('status', 'realizado')
         .gte('date_competencia', startDate)
         .lte('date_competencia', endDate),
       supabaseClient.from('transactions')
@@ -1301,7 +1312,9 @@ async function loadGroupSummary(){
       supabaseClient.from('sales')
         .select('total_amount, status')
         .eq('entity_id', entity.id)
-        .eq('status', 'fechada'),
+        .eq('status', 'fechada')
+        .gte('date_competencia', startDate)
+        .lte('date_competencia', endDate),
       supabaseClient.from('accounts')
         .select('initial_balance')
         .eq('entity_id', entity.id)
@@ -1312,19 +1325,23 @@ async function loadGroupSummary(){
     const salesList = sales || [];
     const allTxs = txsAll || [];
 
-    // Faturamento = todas as vendas fechadas do ano
     const faturamento = salesList.reduce((s,v) => s + Number(v.total_amount), 0);
-
-    // Resultado Líquido = DRE do ano (regime caixa)
     const dre = computeDRE(txList);
 
-    // Saldo real = saldo inicial das contas + todas as entradas realizadas - todas as saídas realizadas
     const saldoInicial = (accounts || []).reduce((s,a) => s + Number(a.initial_balance), 0);
     const entradas = allTxs.filter(t => t.flow_type === 'entrada').reduce((s,t) => s + Number(t.amount), 0);
-    const saidas = allTxs.filter(t => t.flow_type === 'saida').reduce((s,t) => s + Number(t.amount), 0);
+    const saidas   = allTxs.filter(t => t.flow_type === 'saida').reduce((s,t)   => s + Number(t.amount), 0);
     const saldo = saldoInicial + entradas - saidas;
 
-    return { entity, faturamento, resultadoLiq: dre.resultadoLiquido, saldo };
+    // índice de DRE por grupo para a DRE consolidada
+    const dreByGroup = {};
+    txList.forEach(t => {
+      const g = t.categories?.groups?.name;
+      if (!g) return;
+      dreByGroup[g] = (dreByGroup[g] || 0) + Number(t.amount);
+    });
+
+    return { entity, faturamento, resultadoLiq: dre.resultadoLiquido, saldo, dreByGroup, dre };
   }));
 
   state.groupSummary = summaries;
@@ -1702,60 +1719,140 @@ async function selectEntity(entityId){
   render();
 }
 
+async function setGroupFilter(year, month){
+  state.groupFilter = { year: Number(year), month: month ? Number(month) : null };
+  document.getElementById('syncStatus').textContent = 'Carregando…';
+  await loadGroupSummary();
+  document.getElementById('syncStatus').textContent = 'Sincronizado';
+  render();
+}
+
 function renderGrupoDashboard(){
   const summary = state.groupSummary;
-  const { year, month } = state.period || { year: new Date().getFullYear(), month: new Date().getMonth()+1 };
+  const { year, month } = state.groupFilter;
+  const currentYear = new Date().getFullYear();
 
-  const totalFat = summary.reduce((s,x) => s + x.faturamento, 0);
-  const totalRes = summary.reduce((s,x) => s + x.resultadoLiq, 0);
+  const totalFat   = summary.reduce((s,x) => s + x.faturamento, 0);
+  const totalRes   = summary.reduce((s,x) => s + x.resultadoLiq, 0);
   const totalSaldo = summary.reduce((s,x) => s + x.saldo, 0);
 
-  const COMPANY_COLORS = ['var(--pj)', 'var(--pf)', '#8B5FA6', '#C97A4A'];
+  const COMPANY_COLORS = ['#2952A3','#3DB87F','#8B5FA6','#C97A4A'];
+
+  const periodoLabel = month
+    ? `${MONTH_NAMES[month-1]}/${year}`
+    : `Jan–Dez/${year}`;
+
+  // Anos disponíveis para filtro (ano atual + 2 anteriores)
+  const years = [currentYear, currentYear-1, currentYear-2];
+
+  // DRE consolidada — soma dreByGroup de todas as empresas
+  const dreConsolidada = {};
+  summary.forEach(x => {
+    Object.entries(x.dreByGroup || {}).forEach(([g, v]) => {
+      dreConsolidada[g] = (dreConsolidada[g] || 0) + v;
+    });
+  });
+
+  const gc = dreConsolidada;
+  const gn = DRE_GROUP_NAMES;
+  const rec    = gc[gn.receita]              || 0;
+  const ded    = gc[gn.deducoes]             || 0;
+  const cv     = gc[gn.custosVariaveis]      || 0;
+  const pess   = gc[gn.despesasPessoal]      || 0;
+  const op     = gc[gn.despesasOperacionais] || 0;
+  const entNop = gc[gn.entradasNaoOp]        || 0;
+  const saiNop = gc[gn.saidasNaoOp]          || 0;
+
+  const recLiq  = rec - ded;
+  const mc      = recLiq - cv;
+  const ebit    = mc - pess - op;
+  const rl      = ebit + entNop - saiNop;
+  const pct = v => rec > 0 ? ` <span style="font-size:11px; opacity:.7;">(${((v/rec)*100).toFixed(1)}%)</span>` : '';
+
+  const dreRows = [
+    { label: 'Receita Bruta',              v: rec,    tipo: 'receita' },
+    { label: '(-) Deduções da Receita',    v: -ded,   tipo: 'deducao' },
+    { label: '= Receita Líquida',          v: recLiq, tipo: 'kpi' },
+    { label: '(-) Custos Variáveis',       v: -cv,    tipo: 'deducao' },
+    { label: '= Margem de Contribuição',   v: mc,     tipo: 'kpi', pct: true },
+    { label: '(-) Despesas com Pessoal',   v: -pess,  tipo: 'deducao' },
+    { label: '(-) Despesas Operacionais',  v: -op,    tipo: 'deducao' },
+    { label: '= Resultado Operacional (EBIT)', v: ebit, tipo: 'kpi', pct: true },
+    { label: '(+) Entradas Não Operacionais', v: entNop, tipo: 'receita' },
+    { label: '(-) Saídas Não Operacionais',   v: -saiNop, tipo: 'deducao' },
+    { label: '= Resultado Líquido',        v: rl,     tipo: 'kpi_final', pct: true },
+  ];
 
   return `
-    <div style="margin-bottom:20px;">
-      <div style="font-size:13px; color:var(--text-faint); margin-bottom:4px;">
-        Faturamento e Resultado: acumulado de <strong>Jan–Dez/${year}</strong> · Saldo: posição atual das contas
+    <!-- FILTROS -->
+    <div style="display:flex; align-items:center; gap:10px; margin-bottom:20px; flex-wrap:wrap;">
+      <div style="display:flex; align-items:center; gap:6px; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-sm); padding:4px 10px;">
+        <span style="font-size:11.5px; color:var(--text-faint);">Ano:</span>
+        ${years.map(y => `
+          <button onclick="setGroupFilter(${y}, ${month || 'null'})"
+            class="btn btn-sm ${y === year ? 'btn-primary pj' : 'btn-ghost'}"
+            style="padding:3px 10px; font-size:12px;">${y}</button>
+        `).join('')}
+      </div>
+      <div style="display:flex; align-items:center; gap:6px; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-sm); padding:4px 10px; flex-wrap:wrap;">
+        <span style="font-size:11.5px; color:var(--text-faint);">Período:</span>
+        <button onclick="setGroupFilter(${year}, null)"
+          class="btn btn-sm ${!month ? 'btn-primary pj' : 'btn-ghost'}"
+          style="padding:3px 10px; font-size:12px;">Ano todo</button>
+        ${MONTH_NAMES.map((m,i) => `
+          <button onclick="setGroupFilter(${year}, ${i+1})"
+            class="btn btn-sm ${month === i+1 ? 'btn-primary pj' : 'btn-ghost'}"
+            style="padding:3px 8px; font-size:11px;">${m.slice(0,3)}</button>
+        `).join('')}
       </div>
     </div>
 
-    <div class="kpi-row" style="margin-bottom:24px;">
+    <!-- KPIs CONSOLIDADOS -->
+    <div class="kpi-row" style="margin-bottom:20px;">
       <div class="kpi-card">
         <div class="kpi-label">Faturamento do Grupo</div>
         <div class="kpi-value positive">${formatMoney(totalFat)}</div>
-        <div class="kpi-sub">soma das ${summary.length} empresas</div>
+        <div class="kpi-sub">${periodoLabel} · ${summary.length} empresas</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Resultado Líquido do Grupo</div>
         <div class="kpi-value ${totalRes >= 0 ? 'positive' : 'negative'}">${formatMoney(totalRes)}</div>
+        <div class="kpi-sub">${rec > 0 ? ((totalRes/rec)*100).toFixed(1)+'% sobre receita' : periodoLabel}</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label">Saldo Consolidado</div>
         <div class="kpi-value ${totalSaldo >= 0 ? 'positive' : 'negative'}">${formatMoney(totalSaldo)}</div>
+        <div class="kpi-sub">posição atual das contas</div>
       </div>
     </div>
 
-    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:16px;">
+    <!-- CARDS POR EMPRESA -->
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:14px; margin-bottom:24px;">
       ${summary.map((x, idx) => {
         const color = COMPANY_COLORS[idx % COMPANY_COLORS.length];
+        const mcPct = x.dre?.receita > 0 ? ((x.dre.margemContribuicao / x.dre.receita)*100).toFixed(1) : '—';
         return `
-          <div class="panel" style="border-top:4px solid ${color}; cursor:pointer;" onclick="selectEntity('${x.entity.id}')" title="Clique para entrar em ${escapeHtml(x.entity.name)}">
+          <div class="panel" style="border-top:3px solid ${color}; cursor:pointer;" onclick="selectEntity('${x.entity.id}')">
             <div class="panel-header">
-              <div class="panel-title" style="color:${color};">${escapeHtml(x.entity.name)}</div>
-              <span style="font-size:11px; color:var(--text-faint);">acessar →</span>
+              <div class="panel-title" style="color:${color}; font-size:13px;">${escapeHtml(x.entity.name)}</div>
+              <span style="font-size:10px; color:var(--text-faint);">acessar →</span>
             </div>
-            <div style="padding:14px 18px; display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+            <div style="padding:10px 16px; display:grid; grid-template-columns:1fr 1fr; gap:10px;">
               <div>
                 <div class="kpi-label">Faturamento</div>
-                <div class="kpi-value positive" style="font-size:18px;">${formatMoney(x.faturamento)}</div>
+                <div style="font-size:16px; font-weight:700; color:var(--pj);">${formatMoney(x.faturamento)}</div>
+              </div>
+              <div>
+                <div class="kpi-label">MC%</div>
+                <div style="font-size:16px; font-weight:700; color:${Number(mcPct) >= 0 ? 'var(--pj)' : 'var(--danger)'};">${mcPct}%</div>
               </div>
               <div>
                 <div class="kpi-label">Resultado Líquido</div>
-                <div class="kpi-value ${x.resultadoLiq >= 0 ? 'positive' : 'negative'}" style="font-size:18px;">${formatMoney(x.resultadoLiq)}</div>
+                <div style="font-size:16px; font-weight:700; color:${x.resultadoLiq >= 0 ? 'var(--pj)' : 'var(--danger)'};">${formatMoney(x.resultadoLiq)}</div>
               </div>
-              <div style="grid-column:1/-1;">
+              <div>
                 <div class="kpi-label">Saldo em conta</div>
-                <div class="kpi-value ${x.saldo >= 0 ? 'positive' : 'negative'}" style="font-size:18px;">${formatMoney(x.saldo)}</div>
+                <div style="font-size:16px; font-weight:700; color:${x.saldo >= 0 ? 'var(--pj)' : 'var(--danger)'};">${formatMoney(x.saldo)}</div>
               </div>
             </div>
           </div>
@@ -1763,12 +1860,62 @@ function renderGrupoDashboard(){
       }).join('')}
     </div>
 
-    ${summary.length === 0 ? `
-      <div class="empty-state">
-        <div class="empty-state-title">Nenhuma empresa carregada</div>
-        <div>Rode a migração de grupo no Supabase para cadastrar as empresas.</div>
+    <!-- DRE CONSOLIDADA -->
+    <div class="panel">
+      <div class="panel-header">
+        <div class="panel-title">DRE Consolidada — Grupo PGN</div>
+        <span style="font-size:12px; color:var(--text-faint);">${periodoLabel} · Regime Caixa</span>
       </div>
-    ` : ''}
+      <table>
+        <thead>
+          <tr style="background:var(--bg-elevated);">
+            <th style="text-align:left; padding:8px 16px;">Descrição</th>
+            <th style="text-align:right; padding:8px 16px; font-family:var(--font-mono);">Valor (R$)</th>
+            <th style="text-align:right; padding:8px 16px; font-size:11px; color:var(--text-faint);">% Receita</th>
+            ${summary.map(x => `<th style="text-align:right; padding:8px 10px; font-size:11px; color:var(--text-faint);">${escapeHtml(x.entity.name.split(' ')[0])}</th>`).join('')}
+          </tr>
+        </thead>
+        <tbody>
+          ${dreRows.map(row => {
+            const isKpi = row.tipo === 'kpi' || row.tipo === 'kpi_final';
+            const isFinal = row.tipo === 'kpi_final';
+            const color = row.v >= 0 ? 'var(--pj)' : 'var(--danger)';
+            const pctVal = rec > 0 ? ((row.v / rec) * 100).toFixed(1) + '%' : '—';
+            return `
+              <tr style="${isKpi ? `background:var(--bg-elevated); border-top:${isFinal?'2':'1'}px solid var(--border);` : ''}">
+                <td style="padding:${isKpi?'8':'6'}px 16px; font-weight:${isKpi?'700':'400'}; font-size:${isFinal?'13.5':'12.5'}px;">
+                  ${row.label}
+                </td>
+                <td style="text-align:right; padding:6px 16px; font-family:var(--font-mono); font-weight:${isKpi?'700':'400'}; color:${isKpi?color:'var(--text)'}; font-size:${isFinal?'14':'12.5'}px;">
+                  ${formatMoney(row.v)}
+                </td>
+                <td style="text-align:right; padding:6px 16px; font-size:11.5px; color:${isKpi?color:'var(--text-faint)'};">
+                  ${isKpi || row.tipo==='receita' ? pctVal : ''}
+                </td>
+                ${summary.map(x => {
+                  // valor da linha por empresa
+                  const gb = x.dreByGroup || {};
+                  let ev = 0;
+                  if (row.label.includes('Receita Bruta')) ev = gb[gn.receita] || 0;
+                  else if (row.label.includes('Deduções')) ev = -(gb[gn.deducoes] || 0);
+                  else if (row.label.includes('Receita Líquida')) ev = (gb[gn.receita]||0) - (gb[gn.deducoes]||0);
+                  else if (row.label.includes('Custos Variáveis')) ev = -(gb[gn.custosVariaveis]||0);
+                  else if (row.label.includes('Margem de Contribuição')) ev = (gb[gn.receita]||0)-(gb[gn.deducoes]||0)-(gb[gn.custosVariaveis]||0);
+                  else if (row.label.includes('Pessoal')) ev = -(gb[gn.despesasPessoal]||0);
+                  else if (row.label.includes('Operacionais') && row.label.includes('(-)')) ev = -(gb[gn.despesasOperacionais]||0);
+                  else if (row.label.includes('EBIT')) ev = (gb[gn.receita]||0)-(gb[gn.deducoes]||0)-(gb[gn.custosVariaveis]||0)-(gb[gn.despesasPessoal]||0)-(gb[gn.despesasOperacionais]||0);
+                  else if (row.label.includes('Entradas Não')) ev = gb[gn.entradasNaoOp]||0;
+                  else if (row.label.includes('Saídas Não')) ev = -(gb[gn.saidasNaoOp]||0);
+                  else if (row.label.includes('Resultado Líquido')) ev = x.resultadoLiq;
+                  const ec = ev >= 0 ? 'var(--pj)' : 'var(--danger)';
+                  return `<td style="text-align:right; padding:6px 10px; font-size:11.5px; color:${isKpi?ec:'var(--text-faint)'}; font-weight:${isKpi?'600':'400'};">${ev !== 0 ? formatMoney(ev) : '—'}</td>`;
+                }).join('')}
+              </tr>
+            `;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
   `;
 }
 
