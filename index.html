@@ -970,6 +970,9 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
           <button class="nav-item" data-page="orcamento" onclick="setPage('orcamento')">
             <span class="nav-dot"></span> Provisão Orçamentária
           </button>
+          <button class="nav-item" data-page="orcadovsrealizado" onclick="setPage('orcadovsrealizado')">
+            <span class="nav-dot"></span> Orçado vs Realizado
+          </button>
           <button class="nav-item" data-page="projecao" onclick="setPage('projecao')">
             <span class="nav-dot"></span> Simulação de Cenários
             <span style="margin-left:auto; font-size:9px; color:var(--text-faint); border:1px solid var(--border); padding:1px 5px; border-radius:99px;">simulação</span>
@@ -1614,6 +1617,7 @@ const PAGE_TITLES = {
   cartaocredito: 'Cartão de Crédito',
   projecaoautomatica: 'Projeção Automática',
   orcamento: 'Provisão Orçamentária',
+  orcadovsrealizado: 'Orçado vs Realizado',
   projecao: 'Simulação de Cenários',
   saldos: 'Saldos',
   gestaogrupo: 'Gestão do Grupo',
@@ -1690,6 +1694,7 @@ function render(){
     case 'cartaocredito': content.innerHTML = renderCartaoCredito(); break;
     case 'projecaoautomatica': content.innerHTML = renderProjecaoAutomatica(); break;
     case 'orcamento': content.innerHTML = renderOrcamento(); break;
+    case 'orcadovsrealizado': content.innerHTML = renderOrcadoVsRealizado(); break;
     case 'projecao': content.innerHTML = renderProjecao(); break;
     case 'saldos': content.innerHTML = renderSaldos(); break;
     case 'gestaogrupo': content.innerHTML = renderGestaoGrupo(); break;
@@ -2885,6 +2890,178 @@ function computeBudgetKPIs(){
   });
 
   return kpis;
+}
+
+/* ============================================================
+   PÁGINA: ORÇADO VS REALIZADO
+   Cruza a Provisão Orçamentária com o Realizado do fluxo de
+   caixa — mês a mês, por grupo, com variação em R$ e %.
+   ============================================================ */
+function renderOrcadoVsRealizado(){
+  const items = state.budgetItems;
+  if (items.length === 0) return `
+    <div class="empty-state">
+      <div class="empty-state-title">Nenhum item orçado</div>
+      <div>Cadastre itens na aba Provisão Orçamentária primeiro.</div>
+    </div>`;
+
+  // Filtro de mês
+  const selectedMonth = window._ovr_month || null;
+  const now = new Date();
+  const availableMonths = BUDGET_MONTHS.filter(m => m.key <= `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`);
+
+  // Transações realizadas — indexadas por grupo e mês
+  const isTransfer = t => !!t.mirror_transaction_id ||
+    t.categories?.name === 'Transferência Enviada' ||
+    t.categories?.name === 'Transferência Recebida';
+
+  const realByGroup = {}; // { groupType: { monthKey: total } }
+  state.transactions.filter(t => t.status === 'realizado' && !isTransfer(t)).forEach(t => {
+    const mk = t.date_competencia?.slice(0,7);
+    if (!mk) return;
+    // mapeia grupo real para group_type do orçamento
+    const gName = t.categories?.groups?.name || '';
+    const gType = BUDGET_GROUPS.find(g => g.label === gName)?.key || null;
+    if (!gType) return;
+    if (!realByGroup[gType]) realByGroup[gType] = {};
+    realByGroup[gType][mk] = (realByGroup[gType][mk] || 0) + Number(t.amount);
+  });
+
+  // Meses a mostrar
+  const months = selectedMonth
+    ? BUDGET_MONTHS.filter(m => m.key === selectedMonth)
+    : availableMonths;
+
+  const colStyle = 'text-align:right; font-family:var(--font-mono); font-size:12px; padding:6px 8px; min-width:80px;';
+  const lblStyle = 'padding:6px 14px; font-size:12.5px; min-width:180px;';
+
+  // Calcula totais de orçado e realizado por grupo por mês
+  const getOrcado  = (gKey, mk) => (state.budgetItems.filter(i=>i.group_type===gKey).reduce((s,i)=>s+getBudgetVal(i.id,mk),0));
+  const getRealizado = (gKey, mk) => realByGroup[gKey]?.[mk] || 0;
+
+  const varCell = (orc, real, isExpense=false) => {
+    const diff = real - orc;
+    const pct  = orc !== 0 ? ((diff / Math.abs(orc)) * 100).toFixed(1) : null;
+    // Para receita: real > orc = bom (verde). Para despesa: real < orc = bom (verde)
+    const good = isExpense ? diff <= 0 : diff >= 0;
+    const color = diff === 0 ? 'var(--text-faint)' : good ? 'var(--pj)' : 'var(--danger)';
+    const arrow = diff > 0 ? '▲' : diff < 0 ? '▼' : '=';
+    return `<td style="${colStyle} color:${color}; font-size:11.5px;">
+      ${arrow} ${formatMoney(Math.abs(diff))}${pct !== null ? `<br><span style="font-size:10px;">${pct}%</span>` : ''}
+    </td>`;
+  };
+
+  const renderGroupSection = (gKey, isExpense=false) => {
+    const group = BUDGET_GROUPS.find(g => g.key === gKey);
+    const totOrc  = months.reduce((s,m) => s + getOrcado(gKey, m.key), 0);
+    const totReal = months.reduce((s,m) => s + getRealizado(gKey, m.key), 0);
+    return `
+      <tr style="background:var(--bg-elevated);">
+        <td colspan="${months.length*3+2}" style="padding:5px 14px; font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--text-faint); font-weight:600;">${group?.label || gKey}</td>
+      </tr>
+      ${state.budgetItems.filter(i=>i.group_type===gKey).map(item => {
+        const orcTotal  = months.reduce((s,m) => s + getBudgetVal(item.id, m.key), 0);
+        const realTotal = months.reduce((s,m) => s + (realByGroup[gKey]?.[m.key] || 0), 0);
+        return `<tr>
+          <td style="${lblStyle}">${escapeHtml(item.name)}</td>
+          ${months.map(m => {
+            const orc  = getBudgetVal(item.id, m.key);
+            const real = realByGroup[gKey]?.[m.key] || 0;
+            return `
+              <td style="${colStyle}">${orc !== 0 ? formatMoney(orc) : '<span style="color:var(--text-faint);">—</span>'}</td>
+              <td style="${colStyle}; color:${real>0?'var(--pj)':'var(--text-faint)'};">${real !== 0 ? formatMoney(real) : '—'}</td>
+              ${varCell(orc, real, isExpense)}
+            `;
+          }).join('')}
+          <td style="${colStyle} font-weight:600;">${formatMoney(orcTotal)}</td>
+          <td style="${colStyle} font-weight:600; color:var(--pj);">${formatMoney(realTotal)}</td>
+          ${varCell(orcTotal, realTotal, isExpense)}
+        </tr>`;
+      }).join('')}
+    `;
+  };
+
+  const kpiRow = (label, orcFn, realFn, isExpense=false) => {
+    const totOrc  = months.reduce((s,m) => s + orcFn(m.key), 0);
+    const totReal = months.reduce((s,m) => s + realFn(m.key), 0);
+    return `<tr style="background:var(--bg-elevated); border-top:2px solid var(--border);">
+      <td style="${lblStyle} font-weight:700;">${label}</td>
+      ${months.map(m => {
+        const o = orcFn(m.key), r = realFn(m.key);
+        return `
+          <td style="${colStyle} font-weight:700; color:${o>=0?'var(--pj)':'var(--danger)'};">${formatMoney(o)}</td>
+          <td style="${colStyle} font-weight:700; color:${r>=0?'var(--pj)':'var(--danger)'};">${formatMoney(r)}</td>
+          ${varCell(o, r, isExpense)}
+        `;
+      }).join('')}
+      <td style="${colStyle} font-weight:700;">${formatMoney(totOrc)}</td>
+      <td style="${colStyle} font-weight:700; color:${totReal>=0?'var(--pj)':'var(--danger)'};">${formatMoney(totReal)}</td>
+      ${varCell(totOrc, totReal, isExpense)}
+    </tr>`;
+  };
+
+  // Funções de KPI
+  const orcMB  = mk => getOrcado('receita',mk) - getOrcado('deducoes',mk) - getOrcado('custos_variaveis',mk);
+  const realMB = mk => getRealizado('receita',mk) - getRealizado('deducoes',mk) - getRealizado('custos_variaveis',mk);
+  const orcRL  = mk => orcMB(mk) - getOrcado('custos_operacionais',mk) + getOrcado('entradas_nao_op',mk) - getOrcado('saidas_nao_op',mk);
+  const realRL = mk => realMB(mk) - getRealizado('custos_operacionais',mk) + getRealizado('entradas_nao_op',mk) - getRealizado('saidas_nao_op',mk);
+
+  return `
+    <!-- Seletor de mês -->
+    <div style="display:flex; align-items:center; gap:8px; margin-bottom:18px; flex-wrap:wrap;">
+      <span style="font-size:12px; color:var(--text-faint);">Período:</span>
+      <button onclick="window._ovr_month=null; render()"
+        class="btn btn-sm ${!selectedMonth?'btn-primary pj':'btn-ghost'}"
+        style="font-size:11.5px; padding:4px 12px;">Todos os meses</button>
+      ${availableMonths.map(m => `
+        <button onclick="window._ovr_month='${m.key}'; render()"
+          class="btn btn-sm ${selectedMonth===m.key?'btn-primary pj':'btn-ghost'}"
+          style="font-size:11.5px; padding:4px 10px;">${m.label}</button>
+      `).join('')}
+    </div>
+
+    <div class="bridge-note" style="margin-bottom:16px;">
+      <span>ℹ</span>
+      <span>Compara o que foi planejado (Orçado) com o que efetivamente aconteceu (Realizado). Só meses já passados aparecem no realizado. <strong>▲ verde</strong> = acima do planejado para receita, abaixo para despesa. <strong>▼ vermelho</strong> = abaixo do planejado para receita, acima para despesa.</span>
+    </div>
+
+    <div style="overflow-x:auto;">
+      <table style="border-collapse:collapse; width:100%; min-width:${180 + months.length*250}px;">
+        <thead>
+          <tr style="background:var(--bg-elevated); border-bottom:2px solid var(--border);">
+            <th style="${lblStyle} text-align:left;">Item</th>
+            ${months.map(m => `
+              <th style="${colStyle}" colspan="3">${m.label}</th>
+            `).join('')}
+            <th style="${colStyle}" colspan="3" style="border-left:2px solid var(--border);">Total</th>
+          </tr>
+          <tr style="background:var(--bg-elevated); border-bottom:1px solid var(--border);">
+            <th style="${lblStyle} text-align:left; font-size:10.5px; color:var(--text-faint);">
+              ${months.length > 1 ? 'Meses com realizado disponível: ' + availableMonths.length : ''}
+            </th>
+            ${months.map(() => `
+              <th style="${colStyle} font-size:10px; color:var(--text-faint);">Orçado</th>
+              <th style="${colStyle} font-size:10px; color:var(--pj);">Realizado</th>
+              <th style="${colStyle} font-size:10px; color:var(--text-faint);">Var.</th>
+            `).join('')}
+            <th style="${colStyle} font-size:10px; color:var(--text-faint);">Orçado</th>
+            <th style="${colStyle} font-size:10px; color:var(--pj);">Realizado</th>
+            <th style="${colStyle} font-size:10px; color:var(--text-faint);">Var.</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${renderGroupSection('receita')}
+          ${renderGroupSection('deducoes', true)}
+          ${kpiRow('Margem de Contribuição', orcMB, realMB)}
+          ${renderGroupSection('custos_variaveis', true)}
+          ${renderGroupSection('custos_operacionais', true)}
+          ${renderGroupSection('entradas_nao_op')}
+          ${renderGroupSection('saidas_nao_op', true)}
+          ${kpiRow('Resultado Líquido', orcRL, realRL, false)}
+        </tbody>
+      </table>
+    </div>
+  `;
 }
 
 function renderOrcamento(){
