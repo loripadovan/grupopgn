@@ -2489,8 +2489,49 @@ function renderVisaoCaixa(){
     </div>`;
   };
 
+  // ── Alerta de saldo negativo projetado ────────────────────────
+  const today = new Date().toISOString().slice(0,10);
+  const saldoAtual = state.accounts.reduce((s,a) => s + Number(a.initial_balance), 0)
+    + state.transactions.filter(t=>t.status==='realizado'&&t.flow_type==='entrada').reduce((s,t)=>s+Number(t.amount),0)
+    - state.transactions.filter(t=>t.status==='realizado'&&t.flow_type==='saida').reduce((s,t)=>s+Number(t.amount),0);
+
+  // Calcula saldo acumulado dia a dia nos próximos 60 dias
+  const futuroTxs = state.transactions
+    .filter(t => t.status==='previsto' && t.date_competencia > today)
+    .sort((a,b) => a.date_competencia.localeCompare(b.date_competencia));
+
+  let saldoProjetado = saldoAtual;
+  let primeiroDiaNegativo = null;
+  let saldoNegativoValor = 0;
+  const diasVerificados = 60;
+  const dataLimite = new Date();
+  dataLimite.setDate(dataLimite.getDate() + diasVerificados);
+  const dataLimiteStr = dataLimite.toISOString().slice(0,10);
+
+  for (const t of futuroTxs.filter(t => t.date_competencia <= dataLimiteStr)){
+    saldoProjetado += t.flow_type === 'entrada' ? Number(t.amount) : -Number(t.amount);
+    if (saldoProjetado < 0 && !primeiroDiaNegativo){
+      primeiroDiaNegativo = t.date_competencia;
+      saldoNegativoValor = saldoProjetado;
+    }
+  }
+
   return `
     ${renderPeriodSelector()}
+
+    ${primeiroDiaNegativo ? `
+      <div style="background:var(--danger-soft); border:1px solid var(--danger); border-radius:var(--radius); padding:12px 16px; margin-bottom:16px; display:flex; align-items:center; gap:12px;">
+        <span style="font-size:20px;">⚠</span>
+        <div>
+          <div style="font-weight:700; color:var(--danger); font-size:13px;">Saldo negativo projetado</div>
+          <div style="font-size:12px; color:var(--text-dim); margin-top:2px;">
+            Em <strong>${formatDate(primeiroDiaNegativo)}</strong> o saldo acumulado chegará a
+            <strong style="color:var(--danger);">${formatMoney(saldoNegativoValor)}</strong>
+            com os lançamentos previstos. Verifique o Calendário para identificar os pagamentos críticos.
+          </div>
+        </div>
+      </div>
+    ` : ''}
 
     <div class="bridge-note" style="margin-bottom:16px;">
       <span>ℹ</span>
@@ -2527,6 +2568,75 @@ function renderVisaoCaixa(){
         ${varBadge(dre.resultadoLiquido, drePrevMonth?.resultadoLiquido, drePrevYear?.resultadoLiquido)}
       </div>
     </div>
+
+    ${(() => {
+      // ── Indicadores de Liquidez ────────────────────────────────
+      const today = new Date().toISOString().slice(0,10);
+      const allTx = state.transactions;
+
+      // Ativo Circulante = saldo atual das contas + contas a receber (previstos de entrada futuros)
+      const saldoContas = state.accounts.reduce((s,a) => s + Number(a.initial_balance), 0)
+        + allTx.filter(t => t.status==='realizado' && t.flow_type==='entrada').reduce((s,t)=>s+Number(t.amount),0)
+        - allTx.filter(t => t.status==='realizado' && t.flow_type==='saida').reduce((s,t)=>s+Number(t.amount),0);
+
+      const contasReceber = allTx.filter(t =>
+        t.status==='previsto' && t.flow_type==='entrada' && t.date_competencia >= today
+      ).reduce((s,t)=>s+Number(t.amount),0);
+
+      const contasPagar = allTx.filter(t =>
+        t.status==='previsto' && t.flow_type==='saida' && t.date_competencia >= today
+      ).reduce((s,t)=>s+Number(t.amount),0);
+
+      const ativoCirculante  = saldoContas + contasReceber;
+      const passivoCirculante = contasPagar;
+      const capitalDeGiro    = ativoCirculante - passivoCirculante;
+      const ncg              = contasReceber - contasPagar;
+      const liquidezCorrente = passivoCirculante > 0 ? ativoCirculante / passivoCirculante : null;
+
+      const liquidezColor = liquidezCorrente === null ? 'var(--text-faint)'
+        : liquidezCorrente >= 1.5 ? 'var(--pj)'
+        : liquidezCorrente >= 1.0 ? 'var(--warn)'
+        : 'var(--danger)';
+      const liquidezLabel = liquidezCorrente === null ? 'sem passivo'
+        : liquidezCorrente >= 1.5 ? 'saudável'
+        : liquidezCorrente >= 1.0 ? 'atenção'
+        : 'crítico';
+
+      return `
+        <div style="margin-bottom:14px;">
+          <div style="font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--text-faint); font-weight:600; margin-bottom:8px; padding-left:2px;">
+            Indicadores de Liquidez — posição atual
+          </div>
+          <div class="kpi-row kpi-row-compact">
+            <div class="kpi-compact kpi-card">
+              <div class="kpi-label">Ativo Circulante</div>
+              <div class="kpi-value positive">${formatMoney(ativoCirculante)}</div>
+              <div class="kpi-sub">saldo ${formatMoney(saldoContas)} + a receber ${formatMoney(contasReceber)}</div>
+            </div>
+            <div class="kpi-compact kpi-card">
+              <div class="kpi-label">Passivo Circulante</div>
+              <div class="kpi-value negative">${formatMoney(passivoCirculante)}</div>
+              <div class="kpi-sub">contas a pagar (previstas)</div>
+            </div>
+            <div class="kpi-compact kpi-card" style="border-top:3px solid ${capitalDeGiro>=0?'var(--pj)':'var(--danger)'};">
+              <div class="kpi-label">Capital de Giro</div>
+              <div class="kpi-value ${capitalDeGiro>=0?'positive':'negative'}">${formatMoney(capitalDeGiro)}</div>
+              <div class="kpi-sub">Ativo − Passivo Circulante</div>
+            </div>
+            <div class="kpi-compact kpi-card" style="border-top:3px solid ${ncg>=0?'var(--pj)':'var(--danger)'};">
+              <div class="kpi-label">NCG</div>
+              <div class="kpi-value ${ncg>=0?'positive':'negative'}">${formatMoney(ncg)}</div>
+              <div class="kpi-sub">a receber − a pagar</div>
+            </div>
+            <div class="kpi-compact kpi-card" style="border-top:3px solid ${liquidezColor};">
+              <div class="kpi-label">Liquidez Corrente</div>
+              <div class="kpi-value" style="color:${liquidezColor};">${liquidezCorrente !== null ? liquidezCorrente.toFixed(2) : '—'}</div>
+              <div class="kpi-sub" style="color:${liquidezColor};">${liquidezLabel} ${liquidezCorrente!==null?'(ref: ≥ 1,50)':''}</div>
+            </div>
+          </div>
+        </div>
+      `;
+    })()}
 
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:14px;">
       <div class="panel">
@@ -2849,6 +2959,7 @@ function renderOrcamento(){
   return `
     <div style="display:flex; gap:10px; align-items:center; margin-bottom:18px; flex-wrap:wrap;">
       <div style="font-size:12.5px; color:var(--text-faint);">Jun/2026 – Jun/2027 · 13 meses</div>
+      <button class="btn btn-ghost btn-sm" onclick="exportOrcamento()" style="border:1px solid var(--border);">🖨 Exportar</button>
       <div class="bridge-note" style="flex:1; margin:0;">
         <span>ℹ</span>
         <span><strong>"+ Novo item"</strong> cria uma linha nova na DRE (use para um novo cliente ou despesa). Para lançar um valor num mês diferente do <em>mesmo</em> item, clique direto na célula do mês desejado na linha já existente.</span>
@@ -3129,6 +3240,104 @@ async function clearBudgetValue(itemId, monthKey){
 }
 
 /* Modal: configurar saldo inicial e % dedução */
+function exportOrcamento(){
+  const entity = currentEntity();
+  const kpis = computeBudgetKPIs();
+  const items = state.budgetItems;
+  const initialBalance = state.budgetSettings?.initial_cash_balance || 0;
+  const deductionPct = state.budgetSettings?.deduction_pct ?? 6;
+
+  const fmt = v => v.toLocaleString('pt-BR',{style:'currency',currency:'BRL'});
+  const col = (v, isKpi=false) => {
+    const color = v > 0 ? '#1A7A52' : v < 0 ? '#C0392B' : '#666';
+    return `<td style="text-align:right; padding:5px 8px; font-size:10.5px; ${isKpi?`font-weight:700; color:${color};`:'color:#444;'}">${v !== 0 ? fmt(v) : '—'}</td>`;
+  };
+
+  // Seções
+  const sections = [
+    { key:'receita', label:'Receita' },
+    { key:'deducoes', label:'Deduções da Receita' },
+    { key:'custos_variaveis', label:'Custos Variáveis' },
+    { key:'custos_operacionais', label:'Custos Operacionais' },
+    { key:'entradas_nao_op', label:'Entradas Não Operacionais' },
+    { key:'saidas_nao_op', label:'Saídas Não Operacionais' },
+  ];
+
+  const kpiRows = [
+    { label:'Margem de Contribuição', key:'margemBruta' },
+    { label:'Resultado Operacional',  key:'resultadoOp' },
+    { label:'Resultado Líquido',      key:'resultadoLiq' },
+    { label:'Geração de Caixa (Acum.)', key:'geracaoCaixa' },
+  ];
+
+  const headerCols = BUDGET_MONTHS.map(m=>`<th style="text-align:right; padding:5px 8px; font-size:10px; background:#1E3A6E; color:#fff;">${m.label}</th>`).join('');
+  const totalHeader = `<th style="text-align:right; padding:5px 8px; font-size:10px; background:#1E3A6E; color:#fff; border-left:2px solid #fff;">Total</th>`;
+
+  let bodyHTML = '';
+  sections.forEach(sec => {
+    const secItems = items.filter(i => i.group_type === sec.key);
+    bodyHTML += `<tr style="background:#EEF2F8;"><td colspan="${BUDGET_MONTHS.length+2}" style="padding:5px 10px; font-weight:700; font-size:11px; color:#1E3A6E;">${sec.label}</td></tr>`;
+
+    if (sec.key === 'deducoes'){
+      // linha automática de deduções
+      bodyHTML += `<tr><td style="padding:4px 10px; font-size:10.5px; color:#666; padding-left:20px;">DAS / Simples Nacional (${deductionPct}% receita mês ant.)</td>
+        ${BUDGET_MONTHS.map(m => col(kpis[m.key]?.deducaoAuto||0)).join('')}
+        ${col(Object.values(kpis).reduce((s,k)=>s+(k.deducaoAuto||0),0))}
+      </tr>`;
+    } else {
+      secItems.forEach(item => {
+        const rowTotal = BUDGET_MONTHS.reduce((s,m)=>s+getBudgetVal(item.id,m.key),0);
+        bodyHTML += `<tr><td style="padding:4px 10px; font-size:10.5px; color:#333; padding-left:20px;">${item.name}</td>
+          ${BUDGET_MONTHS.map(m => col(getBudgetVal(item.id,m.key))).join('')}
+          ${col(rowTotal)}
+        </tr>`;
+      });
+      if (secItems.length === 0){
+        bodyHTML += `<tr><td colspan="${BUDGET_MONTHS.length+2}" style="padding:4px 20px; font-size:10px; color:#aaa; font-style:italic;">Nenhum item</td></tr>`;
+      }
+    }
+  });
+
+  // KPI rows
+  kpiRows.forEach(r => {
+    const isGeração = r.key === 'geracaoCaixa';
+    bodyHTML += `<tr style="background:#E6EDF8; border-top:2px solid #1E3A6E;">
+      <td style="padding:6px 10px; font-weight:700; font-size:11.5px;">${r.label}</td>
+      ${BUDGET_MONTHS.map(m => col(kpis[m.key]?.[r.key]||0, true)).join('')}
+      <td style="text-align:right; padding:6px 8px; font-weight:700; font-size:11.5px; border-left:2px solid #1E3A6E; color:${isGeração?'inherit':''};">
+        ${isGeração ? 'acumulado' : fmt(Object.values(kpis).reduce((s,k)=>s+(k[r.key]||0),0))}
+      </td>
+    </tr>`;
+  });
+
+  const win = window.open('', '_blank');
+  win.document.write(`<!DOCTYPE html><html><head>
+    <meta charset="UTF-8">
+    <title>Provisão Orçamentária — ${entity?.name||'Grupo PGN'}</title>
+    <style>
+      *{box-sizing:border-box;margin:0;padding:0;}
+      body{font-family:Arial,sans-serif;font-size:11px;color:#111;background:#fff;padding:20px;}
+      h1{font-size:15px;font-weight:700;color:#1E3A6E;margin-bottom:2px;}
+      .sub{font-size:10px;color:#666;margin-bottom:14px;}
+      table{border-collapse:collapse;width:100%;}
+      td{border-bottom:1px solid #eee;}
+      @media print{@page{size:A4 landscape;margin:8mm;}body{padding:0;}}
+    </style>
+  </head><body>
+    <h1>Provisão Orçamentária — ${entity?.name||'Grupo PGN Participações Ltda.'}</h1>
+    <div class="sub">Jun/2026 – Jun/2027 · Saldo inicial: ${fmt(initialBalance)} · Dedução: ${deductionPct}% · Gerado em ${new Date().toLocaleDateString('pt-BR')}</div>
+    <table>
+      <thead><tr>
+        <th style="text-align:left;padding:5px 10px;font-size:10px;background:#1E3A6E;color:#fff;min-width:160px;">Item</th>
+        ${headerCols}${totalHeader}
+      </tr></thead>
+      <tbody>${bodyHTML}</tbody>
+    </table>
+    <script>window.onload=()=>window.print();<\/script>
+  </body></html>`);
+  win.document.close();
+}
+
 function openBudgetSettingsModal(){
   const kind = state.entityKind;
   const currentBalance = state.budgetSettings?.initial_cash_balance || 0;
