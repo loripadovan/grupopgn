@@ -5172,6 +5172,206 @@ async function toggleInstallmentPaid(instId, paid){
   } catch (err) { toast('Erro ao marcar parcela: ' + err.message, 'error'); }
 }
 
+/* ============================================================
+   EXPORTAÇÃO: Fluxo de Caixa
+   Modal para escolher período → gera PDF com:
+   1. Resumo por categoria (totais de entradas e saídas)
+   2. Extrato cronológico detalhado
+   ============================================================ */
+function openExportFluxoModal(){
+  const kind = state.entityKind;
+  const entity = currentEntity();
+  const now = new Date();
+  const thisYear  = now.getFullYear();
+  const thisMonth = String(now.getMonth()+1).padStart(2,'0');
+
+  const host = document.getElementById('modal-host');
+  host.innerHTML = `
+    <div class="modal-overlay" id="exportFluxoOverlay">
+      <div class="modal" style="max-width:380px;">
+        <div class="modal-header">
+          <div class="modal-title">Exportar Fluxo de Caixa</div>
+          <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="field-row">
+            <div class="field">
+              <label for="efDateFrom">De</label>
+              <input type="date" id="efDateFrom" value="${thisYear}-${thisMonth}-01">
+            </div>
+            <div class="field">
+              <label for="efDateTo">Até</label>
+              <input type="date" id="efDateTo" value="${thisYear}-${thisMonth}-31">
+            </div>
+          </div>
+          <div class="field">
+            <label style="display:flex; align-items:center; gap:8px;">
+              <input type="checkbox" id="efIncludeTransfers" style="width:15px;height:15px;">
+              <span style="font-size:13px;">Incluir transferências entre contas</span>
+            </label>
+          </div>
+          <div style="font-size:11.5px; color:var(--text-faint);">
+            Gera um PDF com resumo por categoria e extrato detalhado de todos os lançamentos do período.
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+          <button class="btn btn-primary ${kind}" onclick="exportFluxoCaixa()">Gerar PDF</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.getElementById('exportFluxoOverlay').addEventListener('click', e => {
+    if (e.target.id === 'exportFluxoOverlay') closeModal();
+  });
+}
+
+function exportFluxoCaixa(){
+  const entity = currentEntity();
+  const dateFrom = document.getElementById('efDateFrom').value;
+  const dateTo   = document.getElementById('efDateTo').value;
+  const includeTransfers = document.getElementById('efIncludeTransfers').checked;
+
+  if (!dateFrom || !dateTo) { toast('Informe o período.', 'error'); return; }
+
+  const isTransfer = t => !!t.mirror_transaction_id ||
+    t.categories?.name === 'Transferência Enviada' ||
+    t.categories?.name === 'Transferência Recebida';
+
+  const txs = state.transactions
+    .filter(t => {
+      if (t.date_competencia < dateFrom || t.date_competencia > dateTo) return false;
+      if (!includeTransfers && isTransfer(t)) return false;
+      return true;
+    })
+    .sort((a,b) => a.date_competencia.localeCompare(b.date_competencia));
+
+  // ── Resumo por categoria ──────────────────────────────────────
+  const resumo = {};
+  txs.forEach(t => {
+    const grupo = t.categories?.groups?.name || 'Sem grupo';
+    const cat   = t.categories?.name || 'Sem categoria';
+    const key   = `${grupo}|||${cat}`;
+    if (!resumo[key]) resumo[key] = { grupo, cat, entradas:0, saidas:0 };
+    if (t.flow_type === 'entrada') resumo[key].entradas += Number(t.amount);
+    else resumo[key].saidas += Number(t.amount);
+  });
+
+  const totalEntradas = txs.filter(t=>t.flow_type==='entrada').reduce((s,t)=>s+Number(t.amount),0);
+  const totalSaidas   = txs.filter(t=>t.flow_type==='saida').reduce((s,t)=>s+Number(t.amount),0);
+  const saldoLiq      = totalEntradas - totalSaidas;
+
+  // Saldo acumulado no extrato
+  let acum = 0;
+
+  const fmt = v => v.toLocaleString('pt-BR',{style:'currency',currency:'BRL'});
+  const fmtDate = d => d ? d.split('-').reverse().join('/') : '—';
+
+  // Agrupa resumo por grupo
+  const grupos = {};
+  Object.values(resumo).forEach(r => {
+    if (!grupos[r.grupo]) grupos[r.grupo] = [];
+    grupos[r.grupo].push(r);
+  });
+
+  const resumoHTML = Object.entries(grupos).map(([grupo, cats]) => {
+    const rows = cats.map(c => `
+      <tr>
+        <td style="padding:5px 10px; font-size:11px; color:#444;">${c.cat}</td>
+        <td style="padding:5px 10px; text-align:right; font-size:11px; color:#1A7A52;">${c.entradas>0?fmt(c.entradas):''}</td>
+        <td style="padding:5px 10px; text-align:right; font-size:11px; color:#C0392B;">${c.saidas>0?fmt(c.saidas):''}</td>
+        <td style="padding:5px 10px; text-align:right; font-size:11px; color:${c.entradas-c.saidas>=0?'#1A7A52':'#C0392B'};">${fmt(c.entradas-c.saidas)}</td>
+      </tr>`).join('');
+    const gTotE = cats.reduce((s,c)=>s+c.entradas,0);
+    const gTotS = cats.reduce((s,c)=>s+c.saidas,0);
+    return `
+      <tr style="background:#EEF2F8;">
+        <td colspan="4" style="padding:6px 10px; font-weight:700; font-size:11.5px; color:#1E3A6E;">${grupo}</td>
+      </tr>
+      ${rows}
+      <tr style="background:#F5F5F5; border-top:1px solid #ddd;">
+        <td style="padding:5px 10px; font-size:11px; font-style:italic; color:#666;">Subtotal ${grupo}</td>
+        <td style="padding:5px 10px; text-align:right; font-size:11px; font-weight:600; color:#1A7A52;">${gTotE>0?fmt(gTotE):''}</td>
+        <td style="padding:5px 10px; text-align:right; font-size:11px; font-weight:600; color:#C0392B;">${gTotS>0?fmt(gTotS):''}</td>
+        <td style="padding:5px 10px; text-align:right; font-size:11px; font-weight:600; color:${gTotE-gTotS>=0?'#1A7A52':'#C0392B'};">${fmt(gTotE-gTotS)}</td>
+      </tr>`;
+  }).join('');
+
+  const extratoHTML = txs.map(t => {
+    acum += t.flow_type === 'entrada' ? Number(t.amount) : -Number(t.amount);
+    return `<tr>
+      <td style="padding:4px 8px; font-size:10.5px;">${fmtDate(t.date_competencia)}</td>
+      <td style="padding:4px 8px; font-size:10.5px;">${t.description || '—'}</td>
+      <td style="padding:4px 8px; font-size:10.5px; color:#666;">${t.categories?.name || '—'}</td>
+      <td style="padding:4px 8px; font-size:10px; color:#666;">${t.status === 'realizado' ? 'Realizado' : 'Previsto'}</td>
+      <td style="padding:4px 8px; text-align:right; font-size:10.5px; color:${t.flow_type==='entrada'?'#1A7A52':'#C0392B'};">
+        ${t.flow_type==='entrada'?'+':'-'} ${fmt(Number(t.amount))}
+      </td>
+      <td style="padding:4px 8px; text-align:right; font-size:10.5px; color:${acum>=0?'#1A7A52':'#C0392B'}; font-weight:600;">${fmt(acum)}</td>
+    </tr>`;
+  }).join('');
+
+  const win = window.open('', '_blank');
+  win.document.write(`<!DOCTYPE html><html><head>
+    <meta charset="UTF-8">
+    <title>Fluxo de Caixa — ${entity?.name || 'Grupo PGN'}</title>
+    <style>
+      * { box-sizing:border-box; margin:0; padding:0; }
+      body { font-family:Arial,sans-serif; font-size:12px; color:#111; background:#fff; padding:20px; }
+      h1 { font-size:16px; font-weight:700; color:#1E3A6E; margin-bottom:2px; }
+      .sub { font-size:11px; color:#666; margin-bottom:16px; }
+      h2 { font-size:13px; font-weight:700; color:#1E3A6E; margin:20px 0 8px; border-bottom:2px solid #1E3A6E; padding-bottom:4px; }
+      table { border-collapse:collapse; width:100%; margin-bottom:8px; }
+      th { background:#1E3A6E; color:#fff; padding:6px 10px; text-align:right; font-size:11px; }
+      th:first-child { text-align:left; }
+      td { border-bottom:1px solid #eee; }
+      .total-row td { font-weight:700; font-size:12px; background:#E6EDF8; border-top:2px solid #1E3A6E; padding:7px 10px; }
+      .saldo-positivo { color:#1A7A52; }
+      .saldo-negativo { color:#C0392B; }
+      @media print { @page { size:A4; margin:10mm; } body { padding:0; } }
+    </style>
+  </head><body>
+    <h1>Fluxo de Caixa — ${entity?.name || 'Grupo PGN Participações Ltda.'}</h1>
+    <div class="sub">Período: ${fmtDate(dateFrom)} a ${fmtDate(dateTo)} · Gerado em ${new Date().toLocaleDateString('pt-BR')} · ${txs.length} lançamentos</div>
+
+    <h2>1. Resumo por Categoria</h2>
+    <table>
+      <thead><tr>
+        <th style="text-align:left;">Categoria</th>
+        <th>Entradas</th><th>Saídas</th><th>Saldo</th>
+      </tr></thead>
+      <tbody>${resumoHTML}</tbody>
+      <tr class="total-row">
+        <td>TOTAL GERAL</td>
+        <td style="text-align:right; color:#1A7A52;">${fmt(totalEntradas)}</td>
+        <td style="text-align:right; color:#C0392B;">${fmt(totalSaidas)}</td>
+        <td style="text-align:right; color:${saldoLiq>=0?'#1A7A52':'#C0392B'};">${fmt(saldoLiq)}</td>
+      </tr>
+    </table>
+
+    <h2>2. Extrato Detalhado</h2>
+    <table>
+      <thead><tr>
+        <th style="text-align:left;">Data</th>
+        <th style="text-align:left;">Descrição</th>
+        <th style="text-align:left;">Categoria</th>
+        <th style="text-align:left;">Status</th>
+        <th>Valor</th>
+        <th>Saldo Acum.</th>
+      </tr></thead>
+      <tbody>${extratoHTML}</tbody>
+      <tr class="total-row">
+        <td colspan="4">SALDO FINAL DO PERÍODO</td>
+        <td></td>
+        <td style="text-align:right; color:${saldoLiq>=0?'#1A7A52':'#C0392B'};">${fmt(saldoLiq)}</td>
+      </tr>
+    </table>
+    <script>window.onload = () => window.print();<\/script>
+  </body></html>`);
+  win.document.close();
+  closeModal();
+}
+
 function openTransferModal(){
   const kind = state.entityKind;
   const today = new Date().toISOString().slice(0,10);
@@ -5389,7 +5589,10 @@ function renderLancamentos(){
 
   return `
     ${renderPeriodSelector()}
-    <div style="margin-bottom:10px; display:flex; justify-content:flex-end;">
+    <div style="margin-bottom:10px; display:flex; justify-content:flex-end; gap:8px;">
+      <button class="btn btn-ghost btn-sm" onclick="openExportFluxoModal()" style="border:1px solid var(--border);">
+        🖨 Exportar Fluxo de Caixa
+      </button>
       <button class="btn btn-ghost btn-sm" onclick="openTransferModal()" style="border:1px solid var(--border);">
         ⇄ Transferência entre contas
       </button>
