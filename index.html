@@ -691,6 +691,10 @@ tbody tr.row-selected:hover{ background:var(--danger-soft); filter:brightness(1.
   transition:filter .15s ease, transform .1s ease;
 }
 .kanban-card:hover{ filter:brightness(1.1); }
+.crm-col{ min-height:90px; }
+.crm-card[draggable="true"]{ cursor:grab; }
+.crm-card:active{ cursor:grabbing; }
+.crm-drop-over{ outline:2px dashed var(--pj); outline-offset:-4px; background:var(--pj-soft); }
 .kanban-card:active{ transform:scale(.98); }
 .kanban-card-name{
   font-size:13.5px;
@@ -1606,7 +1610,7 @@ const PAGE_TITLES = {
   dre: 'DRE — Demonstração do Resultado',
   impostos: 'Controle de Impostos',
   pontoequilibrio: 'Ponto de Equilíbrio',
-  crm: 'CRM',
+  crm: 'CRM — Funil Comercial',
   faturamento: 'Faturamento',
   clientes: 'Clientes',
   objetivos: 'Objetivos',
@@ -1652,7 +1656,7 @@ function render(){
     lancamentos: { label: '+ Novo lançamento', action: 'openTransactionModal()' },
     conciliacao: { label: '+ Novo lançamento', action: 'openTransactionModal()' },
     calendario: { label: '+ Novo lançamento', action: 'openTransactionModal()' },
-    crm: { label: '+ Novo contato', action: 'openCrmModal()' },
+    crm: { label: '+ Novo lead', action: 'openCrmModal()' },
     faturamento: { label: '+ Nova venda/proposta', action: 'openSaleModal()' },
     clientes: { label: '+ Novo cliente', action: 'openClientModal()' },
     objetivos: { label: '+ Novo objetivo', action: 'openGoalModal()' },
@@ -6620,49 +6624,192 @@ const CLIENT_STATUS_COLORS = {
 };
 
 /* ============================================================
-   PÁGINA: CRM (contatos comerciais)
-   Isolado do financeiro — não linkado a clientes/faturamento.
-   Colunas: Novo | Lead frio | Em contato | Followup | Perdido
+   PÁGINA: CRM — Funil comercial
+   Etapas: Novo → Contatado → Em conversa → Reunião → Proposta → Ganho
+   Saídas: Nutrição (interesse, mas não agora) e Perdido.
+   Global (não depende da empresa ativa). Lead "Ganho" vira
+   cliente (aba Clientes) com um clique.
    ============================================================ */
-const CRM_COLUMNS = [
-  { key: 'novo',        label: 'Novo',           color: '#5B7FB5' },
-  { key: 'lead_frio',   label: 'Lead frio',       color: '#8B8B8B' },
-  { key: 'em_contato',  label: 'Em contato',      color: '#C97A4A' },
-  { key: 'followup',    label: 'Follow-up',       color: '#C5891A' },
-  { key: 'perdido',     label: 'Perdido',         color: '#C9594A' },
+const CRM_STAGES = [
+  { key:'novo',        label:'Novo',        color:'#5B7FB5', hint:'Ainda não contatado' },
+  { key:'contatado',   label:'Contatado',   color:'#8E92A0', hint:'Mensagem/ligação feita, aguardando resposta' },
+  { key:'em_conversa', label:'Em conversa', color:'#C97A4A', hint:'Respondeu — entendendo a dor e o momento' },
+  { key:'reuniao',     label:'Reunião',     color:'#8B5FA6', hint:'Reunião marcada ou realizada' },
+  { key:'proposta',    label:'Proposta',    color:'#C5891A', hint:'Proposta enviada, aguardando decisão' },
+  { key:'ganho',       label:'Ganho',       color:'#3DB87F', hint:'Fechou' },
+  { key:'nutricao',    label:'Nutrição',    color:'#4A90A4', hint:'Tem interesse, mas não agora — retomar depois' },
+  { key:'perdido',     label:'Perdido',     color:'#C9594A', hint:'Sem interesse / sem perfil' },
 ];
+const CRM_CLOSED   = ['ganho','perdido'];
+const CRM_OPEN     = ['contatado','em_conversa','reuniao','proposta'];
+const CRM_CHANNELS = ['WhatsApp','Ligação','E-mail','Instagram','Reunião','Outro'];
+const CRM_SEGMENTS = ['Alimentação','Automotivo','Beleza e estética','Construção e imóveis','Educação','Indústria','Moda e varejo','Saúde','Serviços','Tecnologia'];
 
-function renderCrm(){
-  const contacts = state.crmContacts;
+function crmDateStr(d){
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+function crmToday(){ return crmDateStr(new Date()); }
+function crmStage(key){ return CRM_STAGES.find(s => s.key === key) || CRM_STAGES[0]; }
+function crmIsOverdue(c, today){
+  return !!c.next_followup && c.next_followup < (today || crmToday()) && !CRM_CLOSED.includes(c.status);
+}
+function crmFmtShort(iso){
+  if (!iso) return '';
+  const [, m, d] = iso.split('-');
+  return `${d}/${m}`;
+}
+function crmWaLink(phone){
+  const d = (phone || '').replace(/\D/g, '');
+  if (d.length < 10) return null;
+  return 'https://wa.me/' + ((d.startsWith('55') && d.length >= 12) ? d : '55' + d);
+}
+function crmAnchorEntityId(){
+  const e = state.entities.find(x => /^gn\b/i.test(x.name)) || state.entities.find(x => x.kind === 'pj') || state.entities[0];
+  return e ? e.id : null;
+}
 
-  if (contacts.length === 0){
-    return `<div class="empty-state"><div class="empty-state-title">Nenhum contato cadastrado</div><div>Clique em "+ Novo contato" para começar.</div></div>`;
-  }
+function crmFiltered(){
+  const f = window._crmFilters || {};
+  const q = (f.q || '').trim().toLowerCase();
+  const qDigits = q.replace(/\D/g, '');
+  const today = crmToday();
+  return state.crmContacts.filter(c => {
+    if (q) {
+      const hay = `${c.name || ''} ${c.contact_person || ''}`.toLowerCase();
+      const cn = (c.cnpj || '').replace(/\D/g, '');
+      if (!hay.includes(q) && !(qDigits && cn.includes(qDigits))) return false;
+    }
+    if (f.porte && c.porte !== f.porte) return false;
+    if (f.month && (c.diagnostic_date || '').slice(0, 7) !== f.month) return false;
+    if (f.segment && (c.segment || '') !== f.segment) return false;
+    if (f.overdue && !crmIsOverdue(c, today)) return false;
+    return true;
+  });
+}
+
+function renderCrmSummary(){
+  const all = state.crmContacts;
+  const today = crmToday();
+  const novo = all.filter(c => c.status === 'novo').length;
+  const andamento = all.filter(c => CRM_OPEN.includes(c.status)).length;
+  const atrasados = all.filter(c => crmIsOverdue(c, today)).length;
+  const ganhos = all.filter(c => c.status === 'ganho').length;
+  return `
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; margin-bottom:14px;">
+      <div class="kpi-card">
+        <div class="kpi-label">Total de leads</div>
+        <div class="kpi-value" style="color:var(--text);">${all.length}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Ainda não contatados</div>
+        <div class="kpi-value" style="color:#5B7FB5;">${novo}</div>
+        <div class="kpi-sub">etapa Novo</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Em andamento</div>
+        <div class="kpi-value" style="color:var(--warn);">${andamento}</div>
+        <div class="kpi-sub">contatado → proposta</div>
+      </div>
+      <div class="kpi-card" style="${atrasados > 0 ? 'border-top:3px solid var(--danger);' : ''}">
+        <div class="kpi-label">Follow-ups atrasados</div>
+        <div class="kpi-value ${atrasados > 0 ? 'negative' : ''}" style="${atrasados > 0 ? '' : 'color:var(--text);'}">${atrasados}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Ganhos</div>
+        <div class="kpi-value positive">${ganhos}</div>
+        <div class="kpi-sub">${all.length > 0 ? ((ganhos / all.length) * 100).toFixed(1) : '0.0'}% do total</div>
+      </div>
+    </div>
+  `;
+}
+
+function renderCrmFollowups(){
+  const today = crmToday();
+  const due = state.crmContacts
+    .filter(c => c.next_followup && c.next_followup <= today && !CRM_CLOSED.includes(c.status))
+    .sort((a, b) => a.next_followup.localeCompare(b.next_followup));
+  if (due.length === 0) return '';
+  const late = due.filter(c => c.next_followup < today).length;
+  const forToday = due.length - late;
+  const open = window._crmFuOpen !== false;
+  const color = late > 0 ? 'var(--danger)' : 'var(--warn)';
+  const soft  = late > 0 ? 'var(--danger-soft)' : 'var(--warn-soft)';
+  return `
+    <div style="border:1px solid ${color}; border-radius:var(--radius); margin-bottom:14px; overflow:hidden;">
+      <div onclick="window._crmFuOpen = (window._crmFuOpen === false); crmRefreshBoard();"
+        style="display:flex; align-items:center; justify-content:space-between; padding:10px 16px; background:${soft}; cursor:pointer; gap:12px;">
+        <div style="font-weight:700; font-size:13px; color:${color};">
+          📅 Follow-ups para fazer: ${late > 0 ? `${late} atrasado${late > 1 ? 's' : ''}` : ''}${late > 0 && forToday > 0 ? ' · ' : ''}${forToday > 0 ? `${forToday} para hoje` : ''}
+        </div>
+        <span style="font-size:11px; color:var(--text-faint);">${open ? '▴ recolher' : '▾ expandir'}</span>
+      </div>
+      ${open ? `
+        <div style="max-height:260px; overflow-y:auto;">
+          ${due.map(c => {
+            const st = crmStage(c.status);
+            const days = Math.round((new Date(today) - new Date(c.next_followup)) / 86400000);
+            return `
+              <div onclick="openCrmModal('${c.id}')" style="display:flex; align-items:center; gap:10px; padding:8px 16px; border-top:1px solid var(--border); cursor:pointer;">
+                <span style="width:8px; height:8px; border-radius:50%; background:${st.color}; flex-shrink:0;"></span>
+                <span style="flex:1; font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(c.name)}</span>
+                <span style="font-size:11px; color:var(--text-faint);">${st.label}</span>
+                <span style="font-size:11px; font-weight:600; color:${days > 0 ? 'var(--danger)' : 'var(--warn)'}; min-width:78px; text-align:right;">${days > 0 ? `${days} dia${days > 1 ? 's' : ''} atrasado` : 'hoje'}</span>
+              </div>`;
+          }).join('')}
+        </div>
+      ` : ''}
+    </div>
+  `;
+}
+
+function renderCrmCard(c){
+  const st = crmStage(c.status);
+  const today = crmToday();
+  const over = crmIsOverdue(c, today);
+  const wa = crmWaLink(c.phone);
+  const chip = txt => `<span style="font-size:10px; padding:1px 6px; border-radius:99px; border:1px solid var(--border); color:var(--text-dim); white-space:nowrap;">${escapeHtml(txt)}</span>`;
+  return `
+    <div class="kanban-card crm-card" draggable="true" ondragstart="crmDragStart(event,'${c.id}')" onclick="openCrmModal('${c.id}')" style="border-left:3px solid ${st.color};">
+      <div class="kanban-card-name" title="${escapeHtml(c.name)}" style="font-size:12.5px; line-height:1.25; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;">${escapeHtml(c.name)}</div>
+      <div style="display:flex; gap:4px; flex-wrap:wrap; margin:5px 0 4px;">
+        ${c.porte ? chip(c.porte) : ''}${c.segment ? chip(c.segment) : ''}
+      </div>
+      ${c.diagnostic_date ? `<div class="kanban-card-meta">Diagnóstico: ${formatDate(c.diagnostic_date)}</div>` : ''}
+      ${c.last_contact_date ? `<div class="kanban-card-meta">Último contato: ${crmFmtShort(c.last_contact_date)}</div>` : ''}
+      ${c.next_followup ? `<div style="font-size:11px; font-weight:600; margin-top:3px; color:${over ? 'var(--danger)' : 'var(--warn)'};">📅 ${crmFmtShort(c.next_followup)}${over ? ' · atrasado' : ''}</div>` : ''}
+      ${wa ? `<a href="${wa}" target="_blank" rel="noopener" onclick="event.stopPropagation();" style="font-size:11px; color:var(--pj); text-decoration:none; display:inline-block; margin-top:4px;">💬 WhatsApp</a>` : ''}
+    </div>
+  `;
+}
+
+function renderCrmBoard(){
+  const list = crmFiltered();
+  const today = crmToday();
+  // atrasados primeiro; depois por data de follow-up; depois diagnóstico mais recente
+  const rank = c => crmIsOverdue(c, today) ? 0 : (c.next_followup ? 1 : 2);
+  const sortFn = (a, b) =>
+    rank(a) - rank(b) ||
+    (a.next_followup || '9').localeCompare(b.next_followup || '9') ||
+    (b.diagnostic_date || '').localeCompare(a.diagnostic_date || '');
 
   return `
-    <div class="kanban-board" style="grid-template-columns:repeat(5, minmax(200px, 1fr));">
-      ${CRM_COLUMNS.map(col => {
-        const items = contacts.filter(c => c.status === col.key);
+    <div class="kanban-board" style="grid-template-columns:repeat(${CRM_STAGES.length}, 240px); overflow-x:auto; padding-bottom:10px;">
+      ${CRM_STAGES.map(st => {
+        const items = list.filter(c => c.status === st.key).sort(sortFn);
         return `
-          <div class="kanban-column">
-            <div class="kanban-column-header" style="border-top:3px solid ${col.color};">
+          <div class="kanban-column" style="max-height:72vh;">
+            <div class="kanban-column-header" style="border-top:3px solid ${st.color};" title="${escapeHtml(st.hint)}">
               <div style="display:flex; align-items:center; gap:7px;">
-                <span style="width:8px; height:8px; border-radius:50%; background:${col.color}; display:inline-block; flex-shrink:0;"></span>
-                <span class="kanban-column-title">${col.label}</span>
+                <span style="width:8px; height:8px; border-radius:50%; background:${st.color}; flex-shrink:0;"></span>
+                <span class="kanban-column-title">${st.label}</span>
               </div>
               <span class="cat-pill">${items.length}</span>
             </div>
-            <div class="kanban-column-body">
-              ${items.length === 0 ? `<div class="kanban-empty">Nenhum contato</div>` :
-                items.map(c => `
-                  <div class="kanban-card" style="border-left:3px solid ${col.color}; cursor:pointer;" onclick="openCrmModal('${c.id}')" title="Clique para editar">
-                    <div class="kanban-card-name">${escapeHtml(c.name)}</div>
-                    ${c.segment ? `<div class="kanban-card-meta">📁 ${escapeHtml(c.segment)}</div>` : ''}
-                    ${c.phone ? `<div class="kanban-card-meta">📞 ${escapeHtml(c.phone)}</div>` : ''}
-                    ${c.instagram ? `<div class="kanban-card-meta">📷 ${escapeHtml(c.instagram)}</div>` : ''}
-                    ${c.contact_date ? `<div class="kanban-card-meta" style="margin-top:4px; font-size:10.5px;">Contato em ${formatDate(c.contact_date)}</div>` : ''}
-                  </div>
-                `).join('')}
+            <div class="kanban-column-body crm-col"
+              ondragover="event.preventDefault(); this.classList.add('crm-drop-over');"
+              ondragleave="this.classList.remove('crm-drop-over');"
+              ondrop="this.classList.remove('crm-drop-over'); crmDrop(event,'${st.key}');">
+              ${items.length === 0 ? `<div class="kanban-empty">Arraste leads para cá</div>` : items.map(renderCrmCard).join('')}
             </div>
           </div>
         `;
@@ -6671,116 +6818,409 @@ function renderCrm(){
   `;
 }
 
+function renderCrmFilterInfo(){
+  const f = window._crmFilters || {};
+  const has = f.q || f.porte || f.month || f.segment || f.overdue;
+  if (!has) return '';
+  return `Mostrando <strong>${crmFiltered().length}</strong> de ${state.crmContacts.length} leads`;
+}
+
+function renderCrm(){
+  const f = window._crmFilters || {};
+  const all = state.crmContacts;
+
+  if (all.length === 0){
+    return `
+      <div class="empty-state">
+        <div class="empty-state-title">Nenhum lead cadastrado</div>
+        <div>Clique em "+ Novo lead" ou importe a lista dos diagnósticos Sebrae (arquivo import_leads_sebrae.sql).</div>
+      </div>`;
+  }
+
+  const months = [...new Set(all.map(c => (c.diagnostic_date || '').slice(0, 7)).filter(Boolean))].sort().reverse();
+  const segs   = [...new Set(all.map(c => c.segment).filter(Boolean))].sort();
+  const portes = [...new Set(all.map(c => c.porte).filter(Boolean))].sort();
+  const monthLabel = k => { const [y, m] = k.split('-'); return `${MONTH_NAMES[Number(m) - 1]}/${y}`; };
+  const hasFilter = f.q || f.porte || f.month || f.segment || f.overdue;
+
+  return `
+    <div id="crmSummary">${renderCrmSummary()}</div>
+    <div id="crmFollowups">${renderCrmFollowups()}</div>
+
+    <div class="panel" style="padding:12px 14px; margin-bottom:14px;">
+      <div style="display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end;">
+        <div class="field" style="margin:0; flex:2 1 220px;">
+          <label style="font-size:11px;">Buscar (nome ou CNPJ)</label>
+          <input type="text" id="crmSearch" placeholder="Buscar..." value="${escapeHtml(f.q || '')}" oninput="setCrmFilter('q', this.value)" style="font-size:12.5px; padding:5px 8px;">
+        </div>
+        <div class="field" style="margin:0; flex:1 1 150px;">
+          <label style="font-size:11px;">Mês do diagnóstico</label>
+          <select onchange="setCrmFilter('month', this.value)" style="font-size:12.5px; padding:5px 8px;">
+            <option value="">Todos</option>
+            ${months.map(m => `<option value="${m}" ${f.month === m ? 'selected' : ''}>${monthLabel(m)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field" style="margin:0; flex:1 1 110px;">
+          <label style="font-size:11px;">Porte</label>
+          <select onchange="setCrmFilter('porte', this.value)" style="font-size:12.5px; padding:5px 8px;">
+            <option value="">Todos</option>
+            ${portes.map(p => `<option value="${escapeHtml(p)}" ${f.porte === p ? 'selected' : ''}>${escapeHtml(p)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="field" style="margin:0; flex:1 1 150px;">
+          <label style="font-size:11px;">Segmento</label>
+          <select onchange="setCrmFilter('segment', this.value)" style="font-size:12.5px; padding:5px 8px;">
+            <option value="">Todos</option>
+            ${segs.map(s => `<option value="${escapeHtml(s)}" ${f.segment === s ? 'selected' : ''}>${escapeHtml(s)}</option>`).join('')}
+          </select>
+        </div>
+        <button class="btn btn-sm ${f.overdue ? 'btn-primary pj' : 'btn-ghost'}" onclick="setCrmFilter('overdue', ${!f.overdue})" style="border:1px solid var(--border); white-space:nowrap;">⏰ Só atrasados</button>
+        <button class="btn btn-ghost btn-sm" onclick="clearCrmFilters()" style="border:1px solid var(--border); white-space:nowrap; opacity:${hasFilter ? '1' : '.35'};" ${hasFilter ? '' : 'disabled'}>✕ Limpar</button>
+      </div>
+      <div id="crmFilterInfo" style="margin-top:8px; font-size:11.5px; color:var(--text-faint);">${renderCrmFilterInfo()}</div>
+    </div>
+
+    <div id="crmBoard">${renderCrmBoard()}</div>
+  `;
+}
+
+function crmRefreshBoard(){
+  const board = document.getElementById('crmBoard');
+  if (!board) { render(); return; }
+  const s = document.getElementById('crmSummary');
+  const fu = document.getElementById('crmFollowups');
+  const info = document.getElementById('crmFilterInfo');
+  if (s) s.innerHTML = renderCrmSummary();
+  if (fu) fu.innerHTML = renderCrmFollowups();
+  if (info) info.innerHTML = renderCrmFilterInfo();
+  board.innerHTML = renderCrmBoard();
+}
+
+function setCrmFilter(key, value){
+  if (!window._crmFilters) window._crmFilters = {};
+  window._crmFilters[key] = value;
+  if (key === 'overdue') { render(); return; }   // só o botão muda de aparência
+  crmRefreshBoard();
+}
+function clearCrmFilters(){
+  window._crmFilters = {};
+  render();
+}
+
+/* ---------- arrastar entre etapas ---------- */
+function crmDragStart(ev, id){
+  window._crmDragId = id;
+  ev.dataTransfer.setData('text/plain', id);
+  ev.dataTransfer.effectAllowed = 'move';
+}
+
+async function crmDrop(ev, stage){
+  ev.preventDefault();
+  const id = window._crmDragId;
+  window._crmDragId = null;
+  const c = state.crmContacts.find(x => x.id === id);
+  if (!c || c.status === stage) return;
+
+  const from = c.status;
+  const prevNext = c.next_followup;
+  c.status = stage;                                  // atualiza na hora
+  if (CRM_CLOSED.includes(stage)) c.next_followup = null;
+  crmRefreshBoard();
+
+  try {
+    const upd = { status: stage };
+    if (CRM_CLOSED.includes(stage)) upd.next_followup = null;
+    const { error } = await supabaseClient.from('crm_contacts').update(upd).eq('id', id);
+    if (error) throw error;
+    await supabaseClient.from('crm_interactions').insert({
+      contact_id: id, channel: 'Sistema', interaction_date: crmToday(),
+      note: `Etapa: ${crmStage(from).label} → ${crmStage(stage).label}`
+    });
+  } catch (err) {
+    c.status = from;                                 // desfaz se falhar
+    c.next_followup = prevNext;
+    crmRefreshBoard();
+    toast('Erro ao mover lead: ' + err.message, 'error');
+  }
+}
+
+/* ---------- modal do lead ---------- */
+function crmSetNext(days){
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  const el = document.getElementById('crmNext');
+  if (el) el.value = crmDateStr(d);
+}
+function crmToggleLost(){
+  const st = document.getElementById('crmStatus')?.value;
+  const f = document.getElementById('crmLostField');
+  if (f) f.style.display = st === 'perdido' ? 'block' : 'none';
+  const n = document.getElementById('crmNextField');
+  if (n) n.style.opacity = CRM_CLOSED.includes(st) ? '.4' : '1';
+}
+
 function openCrmModal(contactId = null){
   const kind = state.entityKind;
-  const editing = contactId ? state.crmContacts.find(c => c.id === contactId) : null;
-  const today = new Date().toISOString().slice(0,10);
-
-  const statusOptions = CRM_COLUMNS.map(col =>
-    `<option value="${col.key}" ${editing?.status === col.key ? 'selected' : (!editing && col.key === 'novo' ? 'selected' : '')}>${col.label}</option>`
-  ).join('');
+  const c = contactId ? state.crmContacts.find(x => x.id === contactId) : null;
+  const v = k => c ? escapeHtml(c[k] ?? '') : '';
+  const status = c ? c.status : 'novo';
+  const stageOpts = CRM_STAGES.map(s => `<option value="${s.key}" ${status === s.key ? 'selected' : ''}>${s.label}</option>`).join('');
+  const segList = [...new Set([...CRM_SEGMENTS, ...state.crmContacts.map(x => x.segment).filter(Boolean)])].sort()
+    .map(s => `<option value="${escapeHtml(s)}">`).join('');
+  const wa = c ? crmWaLink(c.phone) : null;
+  const secTitle = 'font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--text-faint); font-weight:600;';
+  const chipBtn = 'padding:2px 8px; font-size:11px; border:1px solid var(--border);';
 
   const host = document.getElementById('modal-host');
   host.innerHTML = `
     <div class="modal-overlay" id="crmModalOverlay">
-      <div class="modal">
+      <div class="modal" style="max-width:640px;">
         <div class="modal-header">
-          <div class="modal-title">${editing ? 'Editar contato' : 'Novo contato'}</div>
+          <div class="modal-title" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${c ? escapeHtml(c.name) : 'Novo lead'}</div>
           <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
         </div>
-        <div class="modal-body">
+        <div class="modal-body" style="max-height:72vh; overflow-y:auto;">
+
+          ${c && c.client_id ? `<div class="bridge-note"><span>✓</span><span>Este lead já foi convertido em cliente.</span></div>` : ''}
+
+          <div style="${secTitle}">Acompanhamento</div>
+          <div class="field-row">
+            <div class="field">
+              <label for="crmStatus">Etapa</label>
+              <select id="crmStatus" onchange="crmToggleLost()">${stageOpts}</select>
+            </div>
+            <div class="field" id="crmNextField">
+              <label for="crmNext">Próximo follow-up</label>
+              <input type="date" id="crmNext" value="${c?.next_followup || ''}">
+              <div style="display:flex; gap:4px; margin-top:5px; flex-wrap:wrap;">
+                ${[2, 3, 7, 15, 30].map(n => `<button type="button" class="btn btn-ghost btn-sm" style="${chipBtn}" onclick="crmSetNext(${n})">+${n}d</button>`).join('')}
+                <button type="button" class="btn btn-ghost btn-sm" style="${chipBtn}" onclick="document.getElementById('crmNext').value=''">limpar</button>
+              </div>
+            </div>
+          </div>
+          <div class="field" id="crmLostField" style="display:${status === 'perdido' ? 'block' : 'none'};">
+            <label for="crmLost">Motivo da perda</label>
+            <input type="text" id="crmLost" placeholder="Ex: sem orçamento, já tem consultor, fechou o negócio..." value="${v('lost_reason')}">
+          </div>
+
+          ${c ? `
+            <div class="panel" style="padding:12px 14px; background:var(--bg-elevated);">
+              <div style="font-size:12.5px; font-weight:600; margin-bottom:8px;">Registrar contato realizado <span style="font-weight:400; color:var(--text-faint);">(opcional)</span></div>
+              <div class="field">
+                <label for="crmChannel">Canal</label>
+                <select id="crmChannel">${CRM_CHANNELS.map(ch => `<option>${ch}</option>`).join('')}</select>
+              </div>
+              <div class="field" style="margin-top:10px;">
+                <label for="crmNote">O que foi conversado</label>
+                <textarea id="crmNote" rows="2" placeholder="Ex: enviei a mensagem de apresentação; pediu para falar mês que vem..."></textarea>
+              </div>
+            </div>
+          ` : ''}
+
+          <div style="${secTitle} margin-top:4px;">Dados do lead</div>
           <div class="field">
-            <label for="crmName">Nome</label>
-            <input type="text" id="crmName" placeholder="Nome do contato ou empresa" value="${editing ? escapeHtml(editing.name) : ''}">
+            <label for="crmName">Nome / Razão social</label>
+            <input type="text" id="crmName" value="${v('name')}">
           </div>
           <div class="field-row">
             <div class="field">
-              <label for="crmPhone">Telefone / WhatsApp</label>
-              <input type="text" id="crmPhone" placeholder="(48) 99999-9999" value="${editing ? escapeHtml(editing.phone || '') : ''}">
+              <label for="crmCnpj">CNPJ</label>
+              <input type="text" id="crmCnpj" value="${v('cnpj')}">
             </div>
             <div class="field">
-              <label for="crmInstagram">Instagram</label>
-              <input type="text" id="crmInstagram" placeholder="@usuario" value="${editing ? escapeHtml(editing.instagram || '') : ''}">
+              <label for="crmPorte">Porte</label>
+              <select id="crmPorte">
+                ${['', 'MEI', 'ME', 'EPP', 'Demais'].map(p => `<option value="${p}" ${(c?.porte || '') === p ? 'selected' : ''}>${p || '—'}</option>`).join('')}
+              </select>
             </div>
           </div>
           <div class="field-row">
             <div class="field">
               <label for="crmSegment">Segmento</label>
-              <input type="text" id="crmSegment" placeholder="Ex: Restaurante, Barbearia..." value="${editing ? escapeHtml(editing.segment || '') : ''}">
+              <input type="text" id="crmSegment" list="crmSegList" value="${v('segment')}">
+              <datalist id="crmSegList">${segList}</datalist>
             </div>
             <div class="field">
-              <label for="crmContactDate">Data de contato</label>
-              <input type="date" id="crmContactDate" value="${editing ? (editing.contact_date || '') : today}">
+              <label for="crmOrigin">Origem</label>
+              <input type="text" id="crmOrigin" placeholder="Sebrae, indicação, Instagram..." value="${c ? v('origin') : 'Manual'}">
             </div>
           </div>
-          <div class="field">
-            <label for="crmStatus">Status</label>
-            <select id="crmStatus">${statusOptions}</select>
+          <div class="field-row">
+            <div class="field">
+              <label for="crmPhone">Telefone / WhatsApp</label>
+              <input type="text" id="crmPhone" placeholder="(48) 99999-9999" value="${v('phone')}">
+              ${wa ? `<a href="${wa}" target="_blank" rel="noopener" style="font-size:11.5px; color:var(--pj); text-decoration:none; margin-top:3px;">💬 Abrir no WhatsApp</a>` : ''}
+            </div>
+            <div class="field">
+              <label for="crmPerson">Responsável (quem atende)</label>
+              <input type="text" id="crmPerson" value="${v('contact_person')}">
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="crmEmail">E-mail</label>
+              <input type="text" id="crmEmail" value="${v('email')}">
+            </div>
+            <div class="field">
+              <label for="crmInstagram">Instagram</label>
+              <input type="text" id="crmInstagram" placeholder="@usuario" value="${v('instagram')}">
+            </div>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="crmDiag">Data do diagnóstico</label>
+              <input type="date" id="crmDiag" value="${c?.diagnostic_date || ''}">
+            </div>
+            <div></div>
           </div>
           <div class="field">
             <label for="crmNotes">Observações</label>
-            <textarea id="crmNotes" rows="3" placeholder="Anotações sobre esse contato...">${editing ? escapeHtml(editing.notes || '') : ''}</textarea>
+            <textarea id="crmNotes" rows="2" placeholder="Anotações gerais sobre esse lead...">${v('notes')}</textarea>
           </div>
+
+          ${c ? `
+            <div style="${secTitle} margin-top:4px;">Histórico de contatos</div>
+            <div id="crmHistory" style="font-size:12.5px; color:var(--text-faint);">Carregando…</div>
+          ` : ''}
         </div>
         <div class="modal-footer">
-          ${editing ? `<button class="btn btn-ghost" style="color:var(--danger); margin-right:auto;" onclick="deleteCrmContact('${editing.id}')">Excluir</button>` : ''}
+          ${c ? `<button class="btn btn-ghost" style="color:var(--danger); margin-right:auto;" onclick="deleteCrmContact('${c.id}')">Excluir</button>` : ''}
+          ${c && c.status === 'ganho' && !c.client_id ? `<button class="btn btn-ghost" style="border:1px solid var(--pj); color:var(--pj);" onclick="convertCrmToClient('${c.id}')">→ Criar cliente</button>` : ''}
           <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
-          <button class="btn btn-primary ${kind}" onclick="submitCrmContact(${editing ? `'${editing.id}'` : 'null'})">Salvar</button>
+          <button class="btn btn-primary ${kind}" onclick="submitCrmContact(${c ? `'${c.id}'` : 'null'})">Salvar</button>
         </div>
       </div>
     </div>
   `;
-  document.getElementById('crmModalOverlay').addEventListener('click', (e) => {
+  document.getElementById('crmModalOverlay').addEventListener('click', e => {
     if (e.target.id === 'crmModalOverlay') closeModal();
   });
+  crmToggleLost();
+  if (c) loadCrmHistory(c.id);
+}
+
+async function loadCrmHistory(contactId){
+  const host = document.getElementById('crmHistory');
+  if (!host) return;
+  const { data, error } = await supabaseClient.from('crm_interactions').select('*')
+    .eq('contact_id', contactId)
+    .order('interaction_date', { ascending: false })
+    .order('created_at', { ascending: false });
+  if (!document.getElementById('crmHistory')) return;   // modal já fechou
+  if (error) { host.textContent = 'Não foi possível carregar o histórico (a migração do CRM v2 já foi executada?).'; return; }
+  if (!data || data.length === 0) { host.textContent = 'Nenhum contato registrado ainda.'; return; }
+  host.innerHTML = data.map(h => `
+    <div style="display:flex; gap:10px; padding:7px 0; border-bottom:1px solid var(--border);">
+      <div style="min-width:70px; font-size:11px; color:var(--text-faint);">${formatDate(h.interaction_date)}</div>
+      <div style="flex:1;">
+        <span class="cat-pill" style="font-size:10px;">${escapeHtml(h.channel || '')}</span>
+        <div style="font-size:12.5px; color:var(--text); margin-top:3px; white-space:pre-wrap;">${escapeHtml(h.note || '')}</div>
+      </div>
+    </div>
+  `).join('');
 }
 
 async function submitCrmContact(editingId){
-  const name = document.getElementById('crmName').value.trim();
-  const phone = document.getElementById('crmPhone').value.trim();
-  const instagram = document.getElementById('crmInstagram').value.trim();
-  const segment = document.getElementById('crmSegment').value.trim();
-  const contactDate = document.getElementById('crmContactDate').value || null;
-  const status = document.getElementById('crmStatus').value;
-  const notes = document.getElementById('crmNotes').value.trim();
+  const g = id => (document.getElementById(id)?.value || '').trim();
+  const name = g('crmName');
+  if (!name) { toast('Informe o nome do lead.', 'error'); return; }
 
-  if (!name) { toast('Informe o nome do contato.', 'error'); return; }
+  const existing = editingId ? state.crmContacts.find(x => x.id === editingId) : null;
+  const status = g('crmStatus') || 'novo';
+  const closed = CRM_CLOSED.includes(status);
+  const note = g('crmNote');
+  const channel = g('crmChannel') || 'Outro';
 
-  const entity = state.entities?.find(e => e.kind === 'pj') || state.entities?.[0];
-  const entityId = entity?.id;
-  if (!entityId) { toast('Entidade não encontrada.', 'error'); return; }
-
-  const payload = { entity_id: entityId, name, phone: phone || null, instagram: instagram || null, segment: segment || null, contact_date: contactDate, status, notes: notes || null };
+  const payload = {
+    name,
+    cnpj: g('crmCnpj') || null,
+    porte: g('crmPorte') || null,
+    segment: g('crmSegment') || null,
+    origin: g('crmOrigin') || null,
+    phone: g('crmPhone') || null,
+    contact_person: g('crmPerson') || null,
+    email: g('crmEmail') || null,
+    instagram: g('crmInstagram') || null,
+    diagnostic_date: g('crmDiag') || null,
+    notes: g('crmNotes') || null,
+    status,
+    next_followup: closed ? null : (g('crmNext') || null),
+    lost_reason: status === 'perdido' ? (g('crmLost') || null) : null,
+  };
+  if (note) payload.last_contact_date = crmToday();
 
   try {
+    let id = editingId;
     if (editingId) {
       const { error } = await supabaseClient.from('crm_contacts').update(payload).eq('id', editingId);
       if (error) throw error;
-      toast('Contato atualizado.');
     } else {
-      const { error } = await supabaseClient.from('crm_contacts').insert(payload);
+      payload.entity_id = crmAnchorEntityId();
+      if (!payload.entity_id) { toast('Nenhuma empresa encontrada para vincular o lead.', 'error'); return; }
+      const { data, error } = await supabaseClient.from('crm_contacts').insert(payload).select('id').single();
       if (error) throw error;
-      toast('Contato criado.');
+      id = data.id;
     }
+
+    const rows = [];
+    if (note) rows.push({ contact_id: id, channel, note, interaction_date: crmToday() });
+    if (existing && existing.status !== status) {
+      rows.push({ contact_id: id, channel: 'Sistema', interaction_date: crmToday(),
+        note: `Etapa: ${crmStage(existing.status).label} → ${crmStage(status).label}` });
+    }
+    if (rows.length) {
+      const { error: ie } = await supabaseClient.from('crm_interactions').insert(rows);
+      if (ie) throw ie;
+    }
+
+    toast(editingId ? 'Lead atualizado.' : 'Lead criado.');
     closeModal();
     await loadCrmContacts();
     render();
   } catch (err) {
-    toast('Erro ao salvar contato: ' + err.message, 'error');
+    toast('Erro ao salvar lead: ' + err.message, 'error');
   }
 }
 
 async function deleteCrmContact(id){
-  if (!confirm('Excluir este contato do CRM?')) return;
+  if (!confirm('Excluir este lead e todo o histórico de contatos?')) return;
   try {
     const { error } = await supabaseClient.from('crm_contacts').delete().eq('id', id);
     if (error) throw error;
-    toast('Contato excluído.');
+    toast('Lead excluído.');
     closeModal();
     await loadCrmContacts();
     render();
   } catch (err) {
     toast('Erro ao excluir: ' + err.message, 'error');
+  }
+}
+
+async function convertCrmToClient(id){
+  const c = state.crmContacts.find(x => x.id === id);
+  if (!c) return;
+  if (c.client_id) { toast('Este lead já foi convertido em cliente.'); return; }
+  const entity = currentEntity();
+  if (!entity) { toast('Nenhuma empresa ativa.', 'error'); return; }
+  if (!confirm(`Criar "${c.name}" como cliente em ${entity.name}?`)) return;
+  try {
+    const { data, error } = await supabaseClient.from('clients').insert({
+      entity_id: entity.id,
+      name: c.name,
+      document: c.cnpj || null,
+      contact: [c.phone, c.email].filter(Boolean).join(' · ') || null,
+      status: 'cliente_ativo',
+      notes: c.notes || null
+    }).select('id').single();
+    if (error) throw error;
+    const { error: e2 } = await supabaseClient.from('crm_contacts').update({ client_id: data.id }).eq('id', id);
+    if (e2) throw e2;
+    toast(`Cliente criado em ${entity.name}.`);
+    closeModal();
+    await Promise.all([loadCrmContacts(), loadEntityData()]);
+    render();
+  } catch (err) {
+    toast('Erro ao converter em cliente: ' + err.message, 'error');
   }
 }
 
