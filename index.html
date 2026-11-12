@@ -940,6 +940,9 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
           <button class="nav-item" data-page="clientes" onclick="setPage('clientes')">
             <span class="nav-dot"></span> Clientes
           </button>
+          <button class="nav-item" data-page="projetos" onclick="setPage('projetos')">
+            <span class="nav-dot"></span> Projetos
+          </button>
           <button class="nav-item" data-page="objetivos" onclick="setPage('objetivos')">
             <span class="nav-dot"></span> Objetivos
           </button>
@@ -1110,6 +1113,9 @@ const state = {
   goals: [],
   crmContacts: [],
   creditCards: [],
+  projects: [],                    // projetos/consultorias da empresa ativa
+  projectTasks: [],
+  projectsError: null,
   creditCardTxs: [],
   creditCardInstallments: [],
   taxEntries: [],              // controle de impostos (Simples + DARF)
@@ -1263,7 +1269,7 @@ async function boot(){
     const gn = state.entities.find(e => e.name === 'GN Consultoria') || state.entities[0];
     if (gn) state.activeEntityId = gn.id;
 
-    await Promise.all([loadEntityData(), loadCrmContacts(), loadBudget(), loadGroupSummary(), loadCreditCards(), loadTaxEntries()]);
+    await Promise.all([loadEntityData(), loadCrmContacts(), loadBudget(), loadGroupSummary(), loadCreditCards(), loadTaxEntries(), loadProjects()]);
     syncStatus.textContent = 'Sincronizado';
     // Abre no dashboard do grupo
     state.page = 'grupo';
@@ -1613,6 +1619,7 @@ const PAGE_TITLES = {
   crm: 'CRM — Funil Comercial',
   faturamento: 'Faturamento',
   clientes: 'Clientes',
+  projetos: 'Projetos',
   objetivos: 'Objetivos',
   calendario: 'Calendário',
   lancamentos: 'Lançamentos',
@@ -1657,6 +1664,7 @@ function render(){
     conciliacao: { label: '+ Novo lançamento', action: 'openTransactionModal()' },
     calendario: { label: '+ Novo lançamento', action: 'openTransactionModal()' },
     crm: { label: '+ Novo lead', action: 'openCrmModal()' },
+    projetos: { label: '+ Novo projeto', action: 'openProjectModal()' },
     faturamento: { label: '+ Nova venda/proposta', action: 'openSaleModal()' },
     clientes: { label: '+ Novo cliente', action: 'openClientModal()' },
     objetivos: { label: '+ Novo objetivo', action: 'openGoalModal()' },
@@ -1690,6 +1698,7 @@ function render(){
     case 'crm': content.innerHTML = renderCrm(); break;
     case 'faturamento': content.innerHTML = renderFaturamento(); break;
     case 'clientes': content.innerHTML = renderClientes(); break;
+    case 'projetos': content.innerHTML = renderProjetos(); break;
     case 'objetivos': content.innerHTML = renderObjetivos(); break;
     case 'calendario': content.innerHTML = renderCalendario(); break;
     case 'lancamentos': content.innerHTML = renderLancamentos(); break;
@@ -1777,7 +1786,7 @@ async function selectEntity(entityId){
   state.period = { year: new Date().getFullYear(), month: new Date().getMonth() + 1 };
   document.getElementById('syncStatus').textContent = 'Carregando…';
   try {
-    await Promise.all([loadEntityData(), loadCreditCards(), loadTaxEntries()]);
+    await Promise.all([loadEntityData(), loadCreditCards(), loadTaxEntries(), loadProjects()]);
     document.getElementById('syncStatus').textContent = 'Sincronizado';
   } catch (err) {
     toast('Erro ao trocar de empresa: ' + err.message, 'error');
@@ -7221,6 +7230,630 @@ async function convertCrmToClient(id){
     render();
   } catch (err) {
     toast('Erro ao converter em cliente: ' + err.message, 'error');
+  }
+}
+
+/* ============================================================
+   PÁGINA: PROJETOS (consultorias e entregas por cliente)
+   Projeto → tarefas em Kanban: A fazer · Fazendo · Aguardando
+   cliente · Feito. Visão "Tarefas" junta as de todos os projetos.
+   Por empresa (igual Clientes): cada empresa tem seus projetos.
+   ============================================================ */
+const PROJECT_STATUS = [
+  { key:'planejamento', label:'Planejamento', color:'#5B7FB5' },
+  { key:'em_andamento', label:'Em andamento', color:'#3DB87F' },
+  { key:'pausado',      label:'Pausado',      color:'#C5891A' },
+  { key:'concluido',    label:'Concluído',    color:'#4A90A4' },
+  { key:'cancelado',    label:'Cancelado',    color:'#8E92A0' },
+];
+const PROJECT_ACTIVE  = ['planejamento','em_andamento','pausado'];
+const PROJECT_RUNNING = ['planejamento','em_andamento'];   // geram alertas de atraso
+const TASK_COLS = [
+  { key:'a_fazer',    label:'A fazer',            color:'#5B7FB5' },
+  { key:'fazendo',    label:'Fazendo',            color:'#C97A4A' },
+  { key:'aguardando', label:'Aguardando cliente', color:'#C5891A' },
+  { key:'feito',      label:'Feito',              color:'#3DB87F' },
+];
+const TASK_PRIORITY = [
+  { key:'alta',  label:'Alta',  color:'var(--danger)' },
+  { key:'media', label:'Média', color:'var(--warn)' },
+  { key:'baixa', label:'Baixa', color:'var(--text-faint)' },
+];
+
+async function loadProjects(){
+  const entity = currentEntity();
+  state.projectsError = null;
+  if (!entity) { state.projects = []; state.projectTasks = []; return; }
+  const { data: projs, error } = await supabaseClient.from('projects').select('*')
+    .eq('entity_id', entity.id).order('created_at', { ascending: false });
+  if (error) {                       // tabela ainda não existe → não derruba o sistema
+    console.warn('Projetos indisponíveis:', error.message);
+    state.projects = []; state.projectTasks = []; state.projectsError = error.message;
+    return;
+  }
+  state.projects = projs || [];
+  if (state.projects.length === 0) { state.projectTasks = []; return; }
+  const { data: tasks, error: te } = await supabaseClient.from('project_tasks').select('*')
+    .in('project_id', state.projects.map(p => p.id));
+  if (te) { console.warn(te.message); state.projectTasks = []; state.projectsError = te.message; return; }
+  state.projectTasks = tasks || [];
+}
+
+/* ---------- helpers ---------- */
+function pjStatus(key){ return PROJECT_STATUS.find(s => s.key === key) || PROJECT_STATUS[1]; }
+function pjTaskCol(key){ return TASK_COLS.find(s => s.key === key) || TASK_COLS[0]; }
+function pjPrio(key){ return TASK_PRIORITY.find(s => s.key === key) || TASK_PRIORITY[1]; }
+function pjTasksOf(projectId){ return state.projectTasks.filter(t => t.project_id === projectId); }
+function pjTaskOverdue(t, today){ return !!t.due_date && t.due_date < (today || crmToday()) && t.status !== 'feito'; }
+function pjDaysBetween(a, b){ return Math.round((Date.parse(a) - Date.parse(b)) / 86400000); }
+
+function pjStats(p){
+  const today = crmToday();
+  const tasks = pjTasksOf(p.id);
+  const done = tasks.filter(t => t.status === 'feito').length;
+  const open = tasks.filter(t => t.status !== 'feito');
+  const overdue = open.filter(t => pjTaskOverdue(t, today)).length;
+  const waiting = tasks.filter(t => t.status === 'aguardando').length;
+  const nextTask = open.filter(t => t.due_date).sort((a, b) => a.due_date.localeCompare(b.due_date))[0] || null;
+  const running = PROJECT_RUNNING.includes(p.status);
+  const late = running && !!p.due_date && p.due_date < today;
+  const health = !running ? null : (late ? 'atrasado' : (overdue > 0 ? 'atencao' : 'ok'));
+  return { total: tasks.length, done, open: open.length, overdue, waiting, nextTask, late, health,
+           pct: tasks.length ? Math.round((done / tasks.length) * 100) : 0 };
+}
+
+// tarefas em aberto de projetos que estão rodando (pausados/concluídos não geram alerta)
+function pjOpenTasks(){
+  const ids = new Set(state.projects.filter(p => PROJECT_RUNNING.includes(p.status)).map(p => p.id));
+  return state.projectTasks.filter(t => t.status !== 'feito' && ids.has(t.project_id));
+}
+
+const pjBar = (pct, color) =>
+  `<div style="background:var(--bg-elevated); border-radius:5px; height:6px; overflow:hidden;"><div style="width:${pct}%; height:100%; background:${color}; border-radius:5px;"></div></div>`;
+
+function pjHealthBadge(health){
+  if (!health) return '';
+  const map = {
+    atrasado: ['Prazo vencido', 'var(--danger)', 'var(--danger-soft)'],
+    atencao:  ['Tarefas atrasadas', 'var(--warn)', 'var(--warn-soft)'],
+    ok:       ['No prazo', 'var(--pj)', 'var(--pj-soft)'],
+  }[health];
+  return `<span style="font-size:10.5px; font-weight:600; padding:2px 8px; border-radius:99px; color:${map[1]}; background:${map[2]};">${map[0]}</span>`;
+}
+
+/* ---------- navegação interna ---------- */
+function openProject(id){ window._projView = 'detalhe'; window._projId = id; render(); }
+function closeProject(){ window._projView = 'lista'; window._projId = null; render(); }
+function setProjView(v){ window._projView = v; render(); }
+
+function renderProjetos(){
+  if (state.projectsError) {
+    return `
+      <div class="empty-state">
+        <div class="empty-state-title">Módulo de Projetos ainda não está ativo no banco</div>
+        <div>Rode o arquivo <strong>migration_projects.sql</strong> no SQL Editor do Supabase (projeto do Grupo PGN) e recarregue a página.</div>
+      </div>`;
+  }
+  if (window._projView === 'detalhe' && state.projects.find(p => p.id === window._projId)) return renderProjectDetail();
+  if (window._projView === 'detalhe') window._projView = 'lista';
+  return renderProjectsHome();
+}
+
+function renderProjectsKpis(){
+  const today = crmToday();
+  const running = state.projects.filter(p => PROJECT_RUNNING.includes(p.status));
+  const paused = state.projects.filter(p => p.status === 'pausado').length;
+  const lateProjects = running.filter(p => pjStats(p).late).length;
+  const open = pjOpenTasks();
+  const overdue = open.filter(t => pjTaskOverdue(t, today)).length;
+  const waiting = open.filter(t => t.status === 'aguardando').length;
+  return `
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; margin-bottom:14px;">
+      <div class="kpi-card">
+        <div class="kpi-label">Projetos ativos</div>
+        <div class="kpi-value" style="color:var(--text);">${running.length}</div>
+        <div class="kpi-sub">${paused > 0 ? `${paused} pausado${paused > 1 ? 's' : ''}` : 'em andamento'}</div>
+      </div>
+      <div class="kpi-card" style="${lateProjects > 0 ? 'border-top:3px solid var(--danger);' : ''}">
+        <div class="kpi-label">Prazo vencido</div>
+        <div class="kpi-value ${lateProjects > 0 ? 'negative' : ''}" style="${lateProjects > 0 ? '' : 'color:var(--text);'}">${lateProjects}</div>
+        <div class="kpi-sub">projetos</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Tarefas em aberto</div>
+        <div class="kpi-value" style="color:var(--text);">${open.length}</div>
+      </div>
+      <div class="kpi-card" style="${overdue > 0 ? 'border-top:3px solid var(--danger);' : ''}">
+        <div class="kpi-label">Tarefas atrasadas</div>
+        <div class="kpi-value ${overdue > 0 ? 'negative' : ''}" style="${overdue > 0 ? '' : 'color:var(--text);'}">${overdue}</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Aguardando cliente</div>
+        <div class="kpi-value" style="color:var(--warn);">${waiting}</div>
+        <div class="kpi-sub">tarefas paradas</div>
+      </div>
+    </div>`;
+}
+
+/* ---------- home: lista de projetos / tarefas de todos ---------- */
+function renderProjectsHome(){
+  const view = window._projView === 'tarefas' ? 'tarefas' : 'lista';
+  const f = window._projFilter || 'ativos';
+  const tab = (key, label) => `<button class="btn btn-sm ${view === key ? 'btn-primary pj' : 'btn-ghost'}" onclick="setProjView('${key}')" style="padding:5px 14px;">${label}</button>`;
+  const chip = (key, label) => `<button class="btn btn-sm ${f === key ? 'btn-primary pj' : 'btn-ghost'}" onclick="setProjFilter('${key}')" style="font-size:11.5px; padding:4px 12px;">${label}</button>`;
+
+  return `
+    ${renderProjectsKpis()}
+    <div style="display:flex; gap:8px; align-items:center; margin-bottom:14px; flex-wrap:wrap;">
+      <div style="display:flex; gap:4px; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-sm); padding:4px;">
+        ${tab('lista', 'Projetos')}${tab('tarefas', 'Tarefas (todas)')}
+      </div>
+      ${view === 'lista' ? `
+        <div style="display:flex; gap:6px; margin-left:6px;">${chip('ativos', 'Ativos')}${chip('concluidos', 'Concluídos / cancelados')}${chip('todos', 'Todos')}</div>
+        <input type="text" placeholder="Buscar projeto ou cliente..." value="${escapeHtml(window._projQ || '')}" oninput="setProjSearch(this.value)" style="font-size:12.5px; padding:5px 10px; flex:1 1 200px; max-width:300px;">
+      ` : ''}
+    </div>
+    <div id="projContent">${view === 'lista' ? renderProjectCards() : renderAllTasks()}</div>
+  `;
+}
+
+function setProjFilter(f){ window._projFilter = f; render(); }
+function setProjSearch(q){
+  window._projQ = q;
+  const box = document.getElementById('projContent');
+  if (box) box.innerHTML = renderProjectCards();
+}
+
+function renderProjectCards(){
+  const f = window._projFilter || 'ativos';
+  const q = (window._projQ || '').toLowerCase().trim();
+  let list = state.projects.filter(p =>
+    f === 'ativos' ? PROJECT_ACTIVE.includes(p.status) :
+    f === 'concluidos' ? ['concluido', 'cancelado'].includes(p.status) : true);
+  if (q) list = list.filter(p => `${p.name} ${p.client_name || ''}`.toLowerCase().includes(q));
+
+  if (state.projects.length === 0) {
+    return `<div class="empty-state"><div class="empty-state-title">Nenhum projeto cadastrado</div><div>Clique em "+ Novo projeto" para registrar a primeira consultoria.</div></div>`;
+  }
+  if (list.length === 0) return `<div class="empty-state"><div class="empty-state-title">Nenhum projeto nesse filtro</div></div>`;
+
+  const rank = p => { const h = pjStats(p).health; return h === 'atrasado' ? 0 : h === 'atencao' ? 1 : 2; };
+  list.sort((a, b) => rank(a) - rank(b) || (a.due_date || '9').localeCompare(b.due_date || '9'));
+  const today = crmToday();
+
+  return `
+    <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(310px, 1fr)); gap:14px;">
+      ${list.map(p => {
+        const st = pjStatus(p.status);
+        const s = pjStats(p);
+        return `
+          <div class="panel" onclick="openProject('${p.id}')" style="cursor:pointer; padding:14px 16px; border-left:4px solid ${st.color};">
+            <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px;">
+              <div style="min-width:0;">
+                <div style="font-weight:700; font-size:14px; line-height:1.25;">${escapeHtml(p.name)}</div>
+                ${p.client_name ? `<div style="font-size:12px; color:var(--text-faint); margin-top:2px;">${escapeHtml(p.client_name)}</div>` : ''}
+              </div>
+              <span style="font-size:10.5px; padding:2px 8px; border-radius:99px; border:1px solid var(--border); color:var(--text-dim); white-space:nowrap;">${st.label}</span>
+            </div>
+            <div style="margin:10px 0 4px; display:flex; align-items:center; gap:8px;">${pjHealthBadge(s.health)}</div>
+            <div style="margin-top:8px;">
+              ${pjBar(s.pct, st.color)}
+              <div style="display:flex; justify-content:space-between; font-size:11.5px; color:var(--text-faint); margin-top:4px;">
+                <span>${s.total === 0 ? 'sem tarefas' : `${s.done} de ${s.total} tarefas`}</span><span>${s.pct}%</span>
+              </div>
+            </div>
+            <div style="font-size:11.5px; color:var(--text-dim); margin-top:8px; display:flex; flex-direction:column; gap:2px;">
+              ${p.due_date ? `<span style="${s.late ? 'color:var(--danger); font-weight:600;' : ''}">Prazo: ${formatDate(p.due_date)}${s.late ? ` · ${pjDaysBetween(today, p.due_date)} dia(s) de atraso` : ''}</span>` : ''}
+              ${s.nextTask ? `<span>Próxima: ${escapeHtml(s.nextTask.title)} <span style="color:var(--text-faint);">(${crmFmtShort(s.nextTask.due_date)})</span></span>` : ''}
+              ${(s.overdue > 0 || s.waiting > 0) ? `<span>${s.overdue > 0 ? `<span style="color:var(--danger);">${s.overdue} atrasada${s.overdue > 1 ? 's' : ''}</span>` : ''}${s.overdue > 0 && s.waiting > 0 ? ' · ' : ''}${s.waiting > 0 ? `<span style="color:var(--warn);">${s.waiting} aguardando cliente</span>` : ''}</span>` : ''}
+            </div>
+          </div>`;
+      }).join('')}
+    </div>`;
+}
+
+/* ---------- visão: tarefas de todos os projetos ---------- */
+function renderAllTasks(){
+  const today = crmToday();
+  const d7 = new Date(); d7.setDate(d7.getDate() + 7);
+  const week = crmDateStr(d7);
+  const pid = window._projTaskFilter || '';
+  let tasks = pjOpenTasks();
+  if (pid) tasks = tasks.filter(t => t.project_id === pid);
+
+  const byDue = (a, b) => (a.due_date || '9').localeCompare(b.due_date || '9');
+  const groups = [
+    { label:'Atrasadas',      color:'var(--danger)', list: tasks.filter(t => t.due_date && t.due_date < today).sort(byDue) },
+    { label:'Hoje',           color:'var(--warn)',   list: tasks.filter(t => t.due_date === today) },
+    { label:'Próximos 7 dias',color:'var(--pj)',     list: tasks.filter(t => t.due_date && t.due_date > today && t.due_date <= week).sort(byDue) },
+    { label:'Depois',         color:'var(--text-dim)', list: tasks.filter(t => t.due_date && t.due_date > week).sort(byDue) },
+    { label:'Sem data',       color:'var(--text-faint)', list: tasks.filter(t => !t.due_date) },
+  ];
+  const running = state.projects.filter(p => PROJECT_RUNNING.includes(p.status));
+
+  const row = t => {
+    const p = state.projects.find(x => x.id === t.project_id);
+    const pr = pjPrio(t.priority);
+    const col = pjTaskCol(t.status);
+    return `
+      <div onclick="openTaskModal('${t.id}')" style="display:flex; align-items:center; gap:10px; padding:8px 14px; border-top:1px solid var(--border); cursor:pointer;">
+        <input type="checkbox" onclick="event.stopPropagation(); pjQuickDone('${t.id}')" title="Marcar como feita" style="width:15px; height:15px; cursor:pointer; flex-shrink:0;">
+        <span title="Prioridade ${pr.label}" style="width:8px; height:8px; border-radius:50%; background:${pr.color}; flex-shrink:0;"></span>
+        <span style="flex:1; font-size:12.5px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(t.title)}</span>
+        ${t.status !== 'a_fazer' ? `<span style="font-size:10.5px; color:${col.color};">${col.label}</span>` : ''}
+        <span onclick="event.stopPropagation(); openProject('${t.project_id}')" style="font-size:11.5px; color:var(--text-faint); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="Abrir projeto">${escapeHtml(p ? p.name : '')}</span>
+        <span style="font-size:11.5px; min-width:44px; text-align:right; color:${pjTaskOverdue(t, today) ? 'var(--danger)' : 'var(--text-dim)'}; font-weight:${pjTaskOverdue(t, today) ? '600' : '400'};">${t.due_date ? crmFmtShort(t.due_date) : ''}</span>
+      </div>`;
+  };
+
+  return `
+    <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px;">
+      <span style="font-size:12px; color:var(--text-faint);">Projeto:</span>
+      <select onchange="window._projTaskFilter=this.value; render();" style="font-size:12.5px; padding:5px 8px;">
+        <option value="">Todos</option>
+        ${running.map(p => `<option value="${p.id}" ${pid === p.id ? 'selected' : ''}>${escapeHtml(p.name)}</option>`).join('')}
+      </select>
+      <span style="font-size:11.5px; color:var(--text-faint);">Só projetos em andamento ou planejamento. Marque a caixa para concluir a tarefa.</span>
+    </div>
+    ${tasks.length === 0 ? `<div class="empty-state"><div class="empty-state-title">Nenhuma tarefa em aberto</div><div>Abra um projeto e use "+ Nova tarefa".</div></div>` : groups.filter(g => g.list.length).map(g => `
+      <div class="panel" style="margin-bottom:12px; overflow:hidden;">
+        <div style="padding:8px 14px; font-size:11px; text-transform:uppercase; letter-spacing:.06em; font-weight:700; color:${g.color}; display:flex; justify-content:space-between;">
+          <span>${g.label}</span><span>${g.list.length}</span>
+        </div>
+        ${g.list.map(row).join('')}
+      </div>`).join('')}
+  `;
+}
+
+/* ---------- detalhe do projeto: Kanban de tarefas ---------- */
+function renderProjectDetail(){
+  const p = state.projects.find(x => x.id === window._projId);
+  const st = pjStatus(p.status);
+  const s = pjStats(p);
+  const today = crmToday();
+  const tasks = pjTasksOf(p.id);
+  const daysLeft = p.due_date ? pjDaysBetween(p.due_date, today) : null;
+
+  const prioRank = { alta: 0, media: 1, baixa: 2 };
+  const sortOpen = (a, b) => (a.due_date || '9').localeCompare(b.due_date || '9') || prioRank[a.priority] - prioRank[b.priority];
+
+  const card = t => {
+    const pr = pjPrio(t.priority);
+    const over = pjTaskOverdue(t, today);
+    return `
+      <div class="kanban-card crm-card" draggable="true" ondragstart="pjDragStart(event,'${t.id}')" onclick="openTaskModal('${t.id}')" style="border-left:3px solid ${pr.color};">
+        <div style="display:flex; gap:7px; align-items:flex-start;">
+          ${t.status !== 'feito'
+            ? `<input type="checkbox" onclick="event.stopPropagation(); pjQuickDone('${t.id}')" title="Marcar como feita" style="width:14px; height:14px; margin-top:2px; cursor:pointer; flex-shrink:0;">`
+            : `<span style="color:var(--pj); font-size:13px; line-height:1.2;">✓</span>`}
+          <div class="kanban-card-name" style="white-space:normal; font-size:12.5px; line-height:1.3; ${t.status === 'feito' ? 'text-decoration:line-through; opacity:.7;' : ''}">${escapeHtml(t.title)}</div>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; margin-top:6px; font-size:11px;">
+          <span style="color:${pr.color};">● ${pr.label}</span>
+          ${t.due_date ? `<span style="color:${over ? 'var(--danger)' : 'var(--text-dim)'}; font-weight:${over ? '600' : '400'};">📅 ${crmFmtShort(t.due_date)}${over ? ' · atrasada' : ''}</span>` : ''}
+        </div>
+      </div>`;
+  };
+
+  return `
+    <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px; flex-wrap:wrap;">
+      <button class="btn btn-ghost btn-sm" onclick="closeProject()" style="border:1px solid var(--border);">← Projetos</button>
+      <button class="btn btn-ghost btn-sm" onclick="openProjectModal('${p.id}')" style="border:1px solid var(--border);">✎ Editar projeto</button>
+      <button class="btn btn-primary pj btn-sm" onclick="openTaskModal(null,'${p.id}')" style="margin-left:auto;">+ Nova tarefa</button>
+    </div>
+
+    <div class="panel" style="padding:16px 18px; margin-bottom:14px; border-left:4px solid ${st.color};">
+      <div style="display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-start;">
+        <div style="min-width:0;">
+          <div style="font-family:var(--font-display); font-size:18px; font-weight:700;">${escapeHtml(p.name)}</div>
+          ${p.client_name ? `<div style="font-size:13px; color:var(--text-faint); margin-top:2px;">${escapeHtml(p.client_name)}</div>` : ''}
+        </div>
+        <div style="display:flex; gap:8px; align-items:center;">
+          ${pjHealthBadge(s.health)}
+          <span style="font-size:11px; padding:2px 10px; border-radius:99px; border:1px solid var(--border); color:var(--text-dim);">${st.label}</span>
+        </div>
+      </div>
+      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); gap:14px; margin-top:14px;">
+        <div><div class="kpi-label">Progresso</div><div style="font-size:18px; font-weight:700;">${s.pct}%</div>${pjBar(s.pct, st.color)}<div style="font-size:11px; color:var(--text-faint); margin-top:3px;">${s.total === 0 ? 'sem tarefas' : `${s.done} de ${s.total} tarefas`}</div></div>
+        <div><div class="kpi-label">Prazo</div>
+          <div style="font-size:14px; font-weight:600; ${s.late ? 'color:var(--danger);' : ''}">${p.due_date ? formatDate(p.due_date) : '—'}</div>
+          ${daysLeft !== null ? `<div style="font-size:11px; color:${daysLeft < 0 ? 'var(--danger)' : 'var(--text-faint)'};">${daysLeft < 0 ? `${-daysLeft} dia(s) de atraso` : daysLeft === 0 ? 'vence hoje' : `faltam ${daysLeft} dia(s)`}</div>` : ''}</div>
+        <div><div class="kpi-label">Início</div><div style="font-size:14px; font-weight:600;">${p.start_date ? formatDate(p.start_date) : '—'}</div></div>
+        <div><div class="kpi-label">Atrasadas</div><div style="font-size:18px; font-weight:700; ${s.overdue > 0 ? 'color:var(--danger);' : ''}">${s.overdue}</div></div>
+        <div><div class="kpi-label">Aguardando cliente</div><div style="font-size:18px; font-weight:700; ${s.waiting > 0 ? 'color:var(--warn);' : ''}">${s.waiting}</div></div>
+      </div>
+      ${p.description ? `<div style="font-size:12.5px; color:var(--text-dim); margin-top:14px; white-space:pre-wrap; border-top:1px solid var(--border); padding-top:12px;">${escapeHtml(p.description)}</div>` : ''}
+    </div>
+
+    <div class="kanban-board" style="grid-template-columns:repeat(4, minmax(220px, 1fr));">
+      ${TASK_COLS.map(col => {
+        const items = tasks.filter(t => t.status === col.key)
+          .sort(col.key === 'feito' ? ((a, b) => (b.done_at || '').localeCompare(a.done_at || '')) : sortOpen);
+        return `
+          <div class="kanban-column">
+            <div class="kanban-column-header" style="border-top:3px solid ${col.color};">
+              <div style="display:flex; align-items:center; gap:7px;">
+                <span style="width:8px; height:8px; border-radius:50%; background:${col.color};"></span>
+                <span class="kanban-column-title">${col.label}</span>
+              </div>
+              <span class="cat-pill">${items.length}</span>
+            </div>
+            <div class="kanban-column-body crm-col"
+              ondragover="event.preventDefault(); this.classList.add('crm-drop-over');"
+              ondragleave="this.classList.remove('crm-drop-over');"
+              ondrop="this.classList.remove('crm-drop-over'); pjDropTask(event,'${col.key}');">
+              ${items.length === 0 ? `<div class="kanban-empty">${col.key === 'aguardando' ? 'Nada parado esperando o cliente' : 'Arraste tarefas para cá'}</div>` : items.map(card).join('')}
+            </div>
+          </div>`;
+      }).join('')}
+    </div>
+  `;
+}
+
+/* ---------- mover / concluir tarefas ---------- */
+function pjDragStart(ev, id){
+  window._pjDragId = id;
+  ev.dataTransfer.setData('text/plain', id);
+  ev.dataTransfer.effectAllowed = 'move';
+}
+
+async function pjSetTaskStatus(t, status){
+  const prev = { status: t.status, done_at: t.done_at };
+  t.status = status;
+  t.done_at = status === 'feito' ? crmToday() : null;
+  render();
+  try {
+    const { error } = await supabaseClient.from('project_tasks')
+      .update({ status, done_at: t.done_at }).eq('id', t.id);
+    if (error) throw error;
+  } catch (err) {
+    t.status = prev.status; t.done_at = prev.done_at;
+    render();
+    toast('Erro ao atualizar tarefa: ' + err.message, 'error');
+  }
+}
+
+async function pjDropTask(ev, status){
+  ev.preventDefault();
+  const id = window._pjDragId;
+  window._pjDragId = null;
+  const t = state.projectTasks.find(x => x.id === id);
+  if (!t || t.status === status) return;
+  await pjSetTaskStatus(t, status);
+}
+
+async function pjQuickDone(id){
+  const t = state.projectTasks.find(x => x.id === id);
+  if (!t || t.status === 'feito') return;
+  await pjSetTaskStatus(t, 'feito');
+}
+
+/* ---------- modal: projeto ---------- */
+function openProjectModal(projectId = null){
+  const kind = state.entityKind;
+  const p = projectId ? state.projects.find(x => x.id === projectId) : null;
+  const v = k => p ? escapeHtml(p[k] ?? '') : '';
+  const status = p ? p.status : 'em_andamento';
+  const clientNames = [...new Set([
+    ...state.clients.map(c => c.name),
+    ...state.crmContacts.filter(c => c.status === 'ganho').map(c => c.name),
+    ...state.projects.map(x => x.client_name),
+  ].filter(Boolean))].sort();
+
+  const host = document.getElementById('modal-host');
+  host.innerHTML = `
+    <div class="modal-overlay" id="projModalOverlay">
+      <div class="modal" style="max-width:520px;">
+        <div class="modal-header">
+          <div class="modal-title">${p ? 'Editar projeto' : 'Novo projeto'}</div>
+          <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
+        </div>
+        <div class="modal-body" style="max-height:72vh; overflow-y:auto;">
+          <div class="field">
+            <label for="pjName">Nome do projeto</label>
+            <input type="text" id="pjName" placeholder="Ex: Diagnóstico financeiro, Implantação de fluxo de caixa..." value="${v('name')}">
+          </div>
+          <div class="field">
+            <label for="pjClient">Cliente</label>
+            <input type="text" id="pjClient" list="pjClientList" placeholder="Nome do cliente" value="${v('client_name')}">
+            <datalist id="pjClientList">${clientNames.map(n => `<option value="${escapeHtml(n)}">`).join('')}</datalist>
+          </div>
+          <div class="field">
+            <label for="pjStatus">Status</label>
+            <select id="pjStatus">${PROJECT_STATUS.map(s => `<option value="${s.key}" ${status === s.key ? 'selected' : ''}>${s.label}</option>`).join('')}</select>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="pjStart">Início</label>
+              <input type="date" id="pjStart" value="${p?.start_date || (p ? '' : crmToday())}">
+            </div>
+            <div class="field">
+              <label for="pjDue">Prazo final</label>
+              <input type="date" id="pjDue" value="${p?.due_date || ''}">
+            </div>
+          </div>
+          <div class="field">
+            <label for="pjDesc">Escopo e observações</label>
+            <textarea id="pjDesc" rows="3" placeholder="O que será entregue, combinados com o cliente...">${v('description')}</textarea>
+          </div>
+        </div>
+        <div class="modal-footer">
+          ${p ? `<button class="btn btn-ghost" style="color:var(--danger); margin-right:auto;" onclick="deleteProject('${p.id}')">Excluir</button>` : ''}
+          <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+          <button class="btn btn-primary ${kind}" onclick="submitProject(${p ? `'${p.id}'` : 'null'})">Salvar</button>
+        </div>
+      </div>
+    </div>`;
+  document.getElementById('projModalOverlay').addEventListener('click', e => {
+    if (e.target.id === 'projModalOverlay') closeModal();
+  });
+}
+
+async function submitProject(editingId){
+  const g = id => (document.getElementById(id)?.value || '').trim();
+  const name = g('pjName');
+  if (!name) { toast('Informe o nome do projeto.', 'error'); return; }
+  const start = g('pjStart'), due = g('pjDue');
+  if (start && due && due < start) { toast('O prazo final não pode ser anterior ao início.', 'error'); return; }
+  const entity = currentEntity();
+  if (!entity) { toast('Nenhuma empresa ativa.', 'error'); return; }
+
+  const payload = {
+    name, client_name: g('pjClient') || null, status: g('pjStatus') || 'em_andamento',
+    start_date: start || null, due_date: due || null, description: g('pjDesc') || null,
+  };
+  try {
+    let newId = null;
+    if (editingId) {
+      const { error } = await supabaseClient.from('projects').update(payload).eq('id', editingId);
+      if (error) throw error;
+    } else {
+      const { data, error } = await supabaseClient.from('projects')
+        .insert({ ...payload, entity_id: entity.id }).select('id').single();
+      if (error) throw error;
+      newId = data.id;
+    }
+    toast(editingId ? 'Projeto atualizado.' : 'Projeto criado. Adicione as tarefas.');
+    closeModal();
+    await loadProjects();
+    if (newId) { window._projView = 'detalhe'; window._projId = newId; }   // já abre para cadastrar tarefas
+    render();
+  } catch (err) {
+    toast('Erro ao salvar projeto: ' + err.message, 'error');
+  }
+}
+
+async function deleteProject(id){
+  const n = pjTasksOf(id).length;
+  if (!confirm(`Excluir este projeto${n ? ` e suas ${n} tarefa(s)` : ''}? Não dá para desfazer.`)) return;
+  try {
+    const { error } = await supabaseClient.from('projects').delete().eq('id', id);
+    if (error) throw error;
+    toast('Projeto excluído.');
+    closeModal();
+    window._projView = 'lista'; window._projId = null;
+    await loadProjects();
+    render();
+  } catch (err) {
+    toast('Erro ao excluir: ' + err.message, 'error');
+  }
+}
+
+/* ---------- modal: tarefa ---------- */
+function pjSetTaskDue(days){
+  const d = new Date(); d.setDate(d.getDate() + days);
+  const el = document.getElementById('tkDue');
+  if (el) el.value = crmDateStr(d);
+}
+
+function openTaskModal(taskId = null, projectId = null){
+  const kind = state.entityKind;
+  const t = taskId ? state.projectTasks.find(x => x.id === taskId) : null;
+  const pid = t ? t.project_id : (projectId || window._projId || '');
+  const status = t ? t.status : 'a_fazer';
+  const prio = t ? t.priority : 'media';
+  const chipBtn = 'padding:2px 8px; font-size:11px; border:1px solid var(--border);';
+  const projOptions = [...state.projects].sort((a, b) =>
+      (PROJECT_ACTIVE.includes(b.status) ? 1 : 0) - (PROJECT_ACTIVE.includes(a.status) ? 1 : 0) || a.name.localeCompare(b.name))
+    .filter(p => PROJECT_ACTIVE.includes(p.status) || p.id === pid)
+    .map(p => `<option value="${p.id}" ${p.id === pid ? 'selected' : ''}>${escapeHtml(p.name)}${p.client_name ? ' — ' + escapeHtml(p.client_name) : ''}</option>`).join('');
+
+  if (!t && state.projects.length === 0) { toast('Crie um projeto antes de adicionar tarefas.', 'error'); return; }
+
+  const host = document.getElementById('modal-host');
+  host.innerHTML = `
+    <div class="modal-overlay" id="taskModalOverlay">
+      <div class="modal" style="max-width:480px;">
+        <div class="modal-header">
+          <div class="modal-title">${t ? 'Editar tarefa' : 'Nova tarefa'}</div>
+          <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="field">
+            <label for="tkTitle">Tarefa</label>
+            <input type="text" id="tkTitle" placeholder="Ex: Receber extratos de março" value="${t ? escapeHtml(t.title) : ''}">
+          </div>
+          <div class="field">
+            <label for="tkProject">Projeto</label>
+            <select id="tkProject">${projOptions}</select>
+          </div>
+          <div class="field-row">
+            <div class="field">
+              <label for="tkStatus">Etapa</label>
+              <select id="tkStatus">${TASK_COLS.map(c => `<option value="${c.key}" ${status === c.key ? 'selected' : ''}>${c.label}</option>`).join('')}</select>
+            </div>
+            <div class="field">
+              <label for="tkPrio">Prioridade</label>
+              <select id="tkPrio">${TASK_PRIORITY.map(c => `<option value="${c.key}" ${prio === c.key ? 'selected' : ''}>${c.label}</option>`).join('')}</select>
+            </div>
+          </div>
+          <div class="field">
+            <label for="tkDue">Prazo</label>
+            <input type="date" id="tkDue" value="${t?.due_date || ''}">
+            <div style="display:flex; gap:4px; margin-top:5px; flex-wrap:wrap;">
+              ${[1, 3, 7, 14].map(n => `<button type="button" class="btn btn-ghost btn-sm" style="${chipBtn}" onclick="pjSetTaskDue(${n})">+${n}d</button>`).join('')}
+              <button type="button" class="btn btn-ghost btn-sm" style="${chipBtn}" onclick="document.getElementById('tkDue').value=''">limpar</button>
+            </div>
+          </div>
+          <div class="field">
+            <label for="tkNotes">Observações</label>
+            <textarea id="tkNotes" rows="2" placeholder="Detalhes, o que falta do cliente...">${t ? escapeHtml(t.notes || '') : ''}</textarea>
+          </div>
+        </div>
+        <div class="modal-footer">
+          ${t ? `<button class="btn btn-ghost" style="color:var(--danger); margin-right:auto;" onclick="deleteTask('${t.id}')">Excluir</button>` : ''}
+          <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+          <button class="btn btn-primary ${kind}" onclick="submitTask(${t ? `'${t.id}'` : 'null'})">Salvar</button>
+        </div>
+      </div>
+    </div>`;
+  document.getElementById('taskModalOverlay').addEventListener('click', e => {
+    if (e.target.id === 'taskModalOverlay') closeModal();
+  });
+}
+
+async function submitTask(editingId){
+  const g = id => (document.getElementById(id)?.value || '').trim();
+  const title = g('tkTitle');
+  if (!title) { toast('Informe a tarefa.', 'error'); return; }
+  const projectId = g('tkProject');
+  if (!projectId) { toast('Escolha o projeto.', 'error'); return; }
+  const existing = editingId ? state.projectTasks.find(x => x.id === editingId) : null;
+  const status = g('tkStatus') || 'a_fazer';
+
+  const payload = {
+    project_id: projectId, title, status, priority: g('tkPrio') || 'media',
+    due_date: g('tkDue') || null, notes: g('tkNotes') || null,
+    done_at: status === 'feito' ? ((existing && existing.done_at) || crmToday()) : null,
+  };
+  try {
+    if (editingId) {
+      const { error } = await supabaseClient.from('project_tasks').update(payload).eq('id', editingId);
+      if (error) throw error;
+    } else {
+      const { error } = await supabaseClient.from('project_tasks').insert(payload);
+      if (error) throw error;
+    }
+    toast(editingId ? 'Tarefa atualizada.' : 'Tarefa criada.');
+    closeModal();
+    await loadProjects();
+    render();
+  } catch (err) {
+    toast('Erro ao salvar tarefa: ' + err.message, 'error');
+  }
+}
+
+async function deleteTask(id){
+  if (!confirm('Excluir esta tarefa?')) return;
+  try {
+    const { error } = await supabaseClient.from('project_tasks').delete().eq('id', id);
+    if (error) throw error;
+    toast('Tarefa excluída.');
+    closeModal();
+    await loadProjects();
+    render();
+  } catch (err) {
+    toast('Erro ao excluir: ' + err.message, 'error');
   }
 }
 
