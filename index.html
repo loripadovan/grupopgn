@@ -2507,32 +2507,12 @@ function renderVisaoCaixa(){
     </div>`;
   };
 
-  // ── Alerta de saldo negativo projetado ────────────────────────
-  const today = new Date().toISOString().slice(0,10);
-  const saldoAtual = state.accounts.reduce((s,a) => s + Number(a.initial_balance), 0)
-    + state.transactions.filter(t=>t.status==='realizado'&&t.flow_type==='entrada').reduce((s,t)=>s+Number(t.amount),0)
-    - state.transactions.filter(t=>t.status==='realizado'&&t.flow_type==='saida').reduce((s,t)=>s+Number(t.amount),0);
-
-  // Calcula saldo acumulado dia a dia nos próximos 60 dias
-  const futuroTxs = state.transactions
-    .filter(t => t.status==='previsto' && t.date_competencia > today)
-    .sort((a,b) => a.date_competencia.localeCompare(b.date_competencia));
-
-  let saldoProjetado = saldoAtual;
-  let primeiroDiaNegativo = null;
-  let saldoNegativoValor = 0;
-  const diasVerificados = 60;
-  const dataLimite = new Date();
-  dataLimite.setDate(dataLimite.getDate() + diasVerificados);
-  const dataLimiteStr = dataLimite.toISOString().slice(0,10);
-
-  for (const t of futuroTxs.filter(t => t.date_competencia <= dataLimiteStr)){
-    saldoProjetado += t.flow_type === 'entrada' ? Number(t.amount) : -Number(t.amount);
-    if (saldoProjetado < 0 && !primeiroDiaNegativo){
-      primeiroDiaNegativo = t.date_competencia;
-      saldoNegativoValor = saldoProjetado;
-    }
-  }
+  // ── Alerta de saldo negativo projetado (mesma fonte do Calendário) ──
+  const cashAlert = computeCashPosition();
+  const lim60 = new Date(); lim60.setDate(lim60.getDate() + 60);
+  const em60dias = !!cashAlert.firstNegative && cashAlert.firstNegative.date <= crmDateStr(lim60);
+  const primeiroDiaNegativo = em60dias ? cashAlert.firstNegative.date : null;
+  const saldoNegativoValor = em60dias ? cashAlert.firstNegative.balance : 0;
 
   return `
     ${renderPeriodSelector()}
@@ -2593,9 +2573,7 @@ function renderVisaoCaixa(){
       const allTx = state.transactions;
 
       // Ativo Circulante = saldo atual das contas + contas a receber (previstos de entrada futuros)
-      const saldoContas = state.accounts.reduce((s,a) => s + Number(a.initial_balance), 0)
-        + allTx.filter(t => t.status==='realizado' && t.flow_type==='entrada').reduce((s,t)=>s+Number(t.amount),0)
-        - allTx.filter(t => t.status==='realizado' && t.flow_type==='saida').reduce((s,t)=>s+Number(t.amount),0);
+      const saldoContas = computeCashPosition().saldoHoje;   // mesma regra da aba Saldos
 
       const contasReceber = allTx.filter(t =>
         t.status==='previsto' && t.flow_type==='entrada' && t.date_competencia >= today
@@ -4836,6 +4814,159 @@ function renderTxRowSelectable(t){
    ============================================================ */
 window._calendarMonth = null; // { year, month } — inicializado no primeiro render
 
+/* ============================================================
+   POSIÇÃO DE CAIXA — fonte única do "Saldo em caixa"
+   Usada pelo card do Calendário, pelas células do calendário e
+   pelo alerta/liquidez da Visão Caixa.
+
+   • Saldo hoje = mesma regra da aba Saldos: saldo inicial de cada
+     conta + realizados da conta com date_realizado >= data do saldo.
+   • Projeção: parte do saldo de hoje, desconta o que está EM ATRASO
+     a pagar (considerado quitado hoje) e soma/subtrai os lançamentos
+     PREVISTOS de hoje em diante.
+   • Atrasos a RECEBER ficam fora da projeção (conservador: só
+     entram quando você der baixa).
+   ============================================================ */
+function accountBalance(a){
+  const relevant = state.transactions.filter(t =>
+    t.account_id === a.id &&
+    t.status === 'realizado' &&
+    t.date_realizado &&
+    t.date_realizado >= a.initial_balance_date
+  );
+  const entradas = relevant.filter(t => t.flow_type === 'entrada').reduce((s, t) => s + Number(t.amount), 0);
+  const saidas = relevant.filter(t => t.flow_type === 'saida').reduce((s, t) => s + Number(t.amount), 0);
+  return { account: a, entradas, saidas, current: Number(a.initial_balance) + entradas - saidas };
+}
+
+function isTransferTx(t){
+  return !!t.mirror_transaction_id ||
+    t.categories?.name === 'Transferência Enviada' ||
+    t.categories?.name === 'Transferência Recebida';
+}
+
+function computeCashPosition(){
+  const today = crmToday();
+  const accounts = state.accounts;
+  const saldoHoje = accounts.reduce((s, a) => s + accountBalance(a).current, 0);
+  const initialSum = accounts.reduce((s, a) => s + Number(a.initial_balance), 0);
+
+  // movimentos realizados que compõem o saldo (mesma regra), com a data em que o dinheiro se moveu
+  const moves = [];
+  accounts.forEach(a => state.transactions.forEach(t => {
+    if (t.account_id === a.id && t.status === 'realizado' && t.date_realizado && t.date_realizado >= a.initial_balance_date) {
+      moves.push({ d: t.date_realizado, v: (t.flow_type === 'entrada' ? 1 : -1) * Number(t.amount) });
+    }
+  }));
+  const histBalance = dateStr => initialSum + moves.reduce((s, m) => m.d <= dateStr ? s + m.v : s, 0);
+
+  const pend = state.transactions.filter(t => t.status === 'previsto' && !isTransferTx(t) && t.date_competencia);
+  const overduePayList = pend.filter(t => t.flow_type === 'saida'   && t.date_competencia < today);
+  const overdueRecList = pend.filter(t => t.flow_type === 'entrada' && t.date_competencia < today);
+  const overduePay = overduePayList.reduce((s, t) => s + Number(t.amount), 0);
+  const overdueRec = overdueRecList.reduce((s, t) => s + Number(t.amount), 0);
+  const base = saldoHoje - overduePay;   // caixa de hoje depois de quitar os atrasos a pagar
+
+  const byDate = {};
+  pend.filter(t => t.date_competencia >= today).forEach(t => {
+    byDate[t.date_competencia] = (byDate[t.date_competencia] || 0) + (t.flow_type === 'entrada' ? 1 : -1) * Number(t.amount);
+  });
+  const dates = Object.keys(byDate).sort();
+
+  let bal = base;
+  let firstNegative = base < 0 ? { date: today, balance: base } : null;
+  let minPoint = { date: today, balance: base };
+  const path = [];
+  dates.forEach(d => {
+    bal += byDate[d];
+    path.push([d, bal]);
+    if (bal < 0 && !firstNegative) firstNegative = { date: d, balance: bal };
+    if (bal < minPoint.balance) minPoint = { date: d, balance: bal };
+  });
+
+  const projectedOn = dateStr => { let b = base; for (const [d, v] of path) { if (d <= dateStr) b = v; else break; } return b; };
+  const balanceOn = dateStr => dateStr < today ? histBalance(dateStr) : projectedOn(dateStr);
+
+  return {
+    today, saldoHoje, base,
+    overduePay, overdueRec, overduePayCount: overduePayList.length, overdueRecCount: overdueRecList.length,
+    firstNegative, minPoint,
+    horizonEnd: dates.length ? dates[dates.length - 1] : today,
+    hasFuture: dates.length > 0,
+    balanceOn,
+  };
+}
+
+function calendarGoToDate(dateStr){
+  const [y, m] = dateStr.split('-').map(Number);
+  window._calendarMonth = { year: y, month: m };
+  render();
+}
+
+function renderCashCard(cp){
+  const fmtD = d => { const [, m, dd] = d.split('-'); return `${dd}/${m}`; };
+  const wk = d => ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb'][new Date(d + 'T12:00:00').getDay()];
+  const daysTo = d => Math.round((Date.parse(d) - Date.parse(cp.today)) / 86400000);
+  const neg = cp.firstNegative;
+  const color = neg ? 'var(--danger)' : 'var(--pj)';
+  const needed = cp.minPoint.balance < 0 ? -cp.minPoint.balance : 0;
+  const cell = 'padding:14px 18px;';
+
+  let projection;
+  if (neg) {
+    const n = daysTo(neg.date);
+    projection = `
+      <div style="font-weight:700; font-size:14px; color:var(--danger);">
+        ⚠ ${neg.date === cp.today ? 'Já fica negativo hoje, ao quitar os atrasos' : `Caixa fica negativo em ${fmtD(neg.date)} (${wk(neg.date)})`}
+      </div>
+      <div style="font-size:12px; color:var(--text-dim); margin-top:3px;">
+        ${neg.date === cp.today ? '' : `${n === 1 ? 'amanhã' : `em ${n} dias`} · `}saldo de <strong style="color:var(--danger);">${formatMoney(neg.balance)}</strong> nesse dia
+      </div>
+      <div style="font-size:12px; color:var(--text-dim); margin-top:3px;">
+        Menor saldo: <strong style="color:var(--danger);">${formatMoney(cp.minPoint.balance)}</strong> em ${fmtD(cp.minPoint.date)}
+        · <strong>faltam ${formatMoney(needed)}</strong> para cobrir
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="calendarGoToDate('${neg.date}')" style="margin-top:8px; border:1px solid var(--danger); color:var(--danger);">Ver no calendário →</button>`;
+  } else if (cp.hasFuture) {
+    projection = `
+      <div style="font-weight:700; font-size:14px; color:var(--pj);">✓ Sem falta de caixa até ${formatDate(cp.horizonEnd)}</div>
+      <div style="font-size:12px; color:var(--text-dim); margin-top:3px;">
+        Menor saldo projetado: <strong>${formatMoney(cp.minPoint.balance)}</strong> em ${cp.minPoint.date === cp.today ? 'hoje' : fmtD(cp.minPoint.date)}
+      </div>`;
+  } else {
+    projection = `
+      <div style="font-weight:700; font-size:14px; color:var(--pj);">✓ Sem falta de caixa</div>
+      <div style="font-size:12px; color:var(--text-dim); margin-top:3px;">Não há lançamentos previstos para projetar.</div>`;
+  }
+
+  return `
+    <div class="panel" style="margin-bottom:16px; border-top:3px solid ${color}; overflow:hidden;">
+      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(250px, 1fr));">
+        <div style="${cell}">
+          <div style="font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; font-weight:700; color:var(--text-faint);">Saldo em caixa hoje</div>
+          <div class="amount" style="font-size:26px; font-weight:700; margin-top:4px; color:${cp.saldoHoje >= 0 ? 'var(--pj)' : 'var(--danger)'};">${formatMoney(cp.saldoHoje)}</div>
+          <div style="font-size:11.5px; color:var(--text-faint); margin-top:2px;">posição real das contas · igual à aba Saldos</div>
+        </div>
+        <div style="${cell} border-left:1px solid var(--border);">
+          <div style="font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; font-weight:700; color:var(--text-faint);">Atrasos pendentes</div>
+          <div style="font-size:13px; margin-top:6px; display:flex; flex-direction:column; gap:3px;">
+            <div style="display:flex; justify-content:space-between; gap:10px;"><span style="color:var(--text-dim);">A pagar${cp.overduePayCount ? ` (${cp.overduePayCount})` : ''}</span><strong style="color:${cp.overduePay > 0 ? 'var(--danger)' : 'var(--text-faint)'};">${formatMoney(cp.overduePay)}</strong></div>
+            <div style="display:flex; justify-content:space-between; gap:10px;"><span style="color:var(--text-dim);">A receber${cp.overdueRecCount ? ` (${cp.overdueRecCount})` : ''}</span><span style="color:var(--text-faint);">${formatMoney(cp.overdueRec)} <span style="font-size:10.5px;">fora da projeção</span></span></div>
+            <div style="display:flex; justify-content:space-between; gap:10px; border-top:1px dashed var(--border); padding-top:5px; margin-top:2px;"><span style="color:var(--text-dim);">Caixa após quitar atrasos</span><strong style="color:${cp.base >= 0 ? 'var(--text)' : 'var(--danger)'};">${formatMoney(cp.base)}</strong></div>
+          </div>
+        </div>
+        <div style="${cell} border-left:1px solid var(--border);">
+          <div style="font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; font-weight:700; color:var(--text-faint); margin-bottom:6px;">Projeção do caixa</div>
+          ${projection}
+        </div>
+      </div>
+      <div style="padding:8px 18px; border-top:1px solid var(--border); font-size:11px; color:var(--text-faint); background:var(--bg-elevated);">
+        Considera os lançamentos previstos já cadastrados${cp.hasFuture ? ` (até ${formatDate(cp.horizonEnd)})` : ''}. Atrasos a pagar entram como pagos hoje; atrasos a receber só entram quando você der baixa. Despesas ainda não lançadas não aparecem aqui.
+      </div>
+    </div>
+  `;
+}
+
 function ensureCalendarMonth(){
   if (!window._calendarMonth) {
     const now = new Date();
@@ -4985,35 +5116,10 @@ function renderCalendario(){
   const totalSaidasPrevistas   = saidasTotal;
   const totalAtrasados = monthTxs.filter(t => t.status === 'previsto' && t.date_competencia < todayStr).length;
 
-  // Saldo acumulado por dia:
-  // Ponto de partida = saldo atual real das contas (initial_balance + realizados até hoje)
-  const saldoAtualContas = state.accounts.reduce((s,a) => s + Number(a.initial_balance), 0)
-    + state.transactions.filter(t => t.status === 'realizado' && t.flow_type === 'entrada' && t.date_competencia <= todayStr).reduce((s,t) => s + Number(t.amount), 0)
-    - state.transactions.filter(t => t.status === 'realizado' && t.flow_type === 'saida'   && t.date_competencia <= todayStr).reduce((s,t) => s + Number(t.amount), 0);
-
-  // Para dias antes de hoje: o saldo acumulado é o saldo real naquele momento histórico
-  // Para hoje e futuros: parte do saldo atual e acumula previstos
-  // Monta saldo acumulado por dia do mês
-  const saldoAcumuladoPorDia = {};
-  // Primeiro calcula o saldo no início do mês (antes do dia 1)
-  const monthStr = `${year}-${String(month).padStart(2,'0')}`;
-  const saldoInicioMes = state.accounts.reduce((s,a) => s + Number(a.initial_balance), 0)
-    + state.transactions.filter(t => t.status === 'realizado' && t.flow_type === 'entrada' && t.date_competencia < `${monthStr}-01`).reduce((s,t) => s + Number(t.amount), 0)
-    - state.transactions.filter(t => t.status === 'realizado' && t.flow_type === 'saida'   && t.date_competencia < `${monthStr}-01`).reduce((s,t) => s + Number(t.amount), 0);
-
-  let saldoAcumulado = saldoInicioMes;
-  for (let d = 1; d <= daysInMonth; d++) {
-    const dateStr = `${monthStr}-${String(d).padStart(2,'0')}`;
-    const txsDay = byDay[d] || [];
-    // realizados sempre contam; previstos só contam a partir de hoje
-    txsDay.forEach(t => {
-      if (t.status === 'realizado' || dateStr >= todayStr) {
-        if (t.flow_type === 'entrada') saldoAcumulado += Number(t.amount);
-        else saldoAcumulado -= Number(t.amount);
-      }
-    });
-    saldoAcumuladoPorDia[d] = saldoAcumulado;
-  }
+  // Saldo acumulado por dia — mesma fonte do card "Saldo em caixa":
+  // dias passados = saldo real histórico; hoje e futuro = projeção
+  // (atrasos a pagar considerados quitados hoje + lançamentos previstos).
+  const cashPos = computeCashPosition();
 
   // monta células: espaços em branco antes do dia 1, depois os dias do mês
   let cells = '';
@@ -5031,8 +5137,8 @@ function renderCalendario(){
     const saidasTotalDia = saidas.reduce((s,t)=>s+Number(t.amount),0);
     const hasOverdue = items.some(t => t.status === 'previsto' && isPast);
     const saldoDia = entradasTotalDia - saidasTotalDia;
-    const saldoAcum = saldoAcumuladoPorDia[day];
-    const isFuture = dateStr > todayStr;
+    const saldoAcum = cashPos.balanceOn(dateStr);
+    const isFuture = dateStr >= todayStr;   // hoje e futuro = projeção (≈)
 
     cells += `
       <div class="cal-cell ${isToday ? 'cal-cell-today' : ''} ${items.length > 0 ? 'cal-cell-has-items' : ''}" onclick="${items.length > 0 ? `openDayDetailModal('${dateStr}')` : ''}">
@@ -5054,6 +5160,7 @@ function renderCalendario(){
   const WEEKDAY_LABELS = ['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];
 
   return `
+    ${renderCashCard(cashPos)}
     ${overduePanel}
     <div style="display:flex; align-items:center; gap:10px; margin-bottom:18px; flex-wrap:wrap;">
       <div style="display:flex; align-items:center; gap:4px; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-sm); padding:4px;">
@@ -9459,18 +9566,7 @@ function renderSaldos(){
     return `<div class="empty-state"><div class="empty-state-title">Nenhuma conta cadastrada</div><div>Cadastre contas em "Contas" para ver os saldos aqui.</div></div>`;
   }
 
-  const rows = state.accounts.map(a => {
-    const relevant = state.transactions.filter(t =>
-      t.account_id === a.id &&
-      t.status === 'realizado' &&
-      t.date_realizado &&
-      t.date_realizado >= a.initial_balance_date
-    );
-    const entradas = relevant.filter(t => t.flow_type === 'entrada').reduce((s,t)=>s+Number(t.amount),0);
-    const saidas = relevant.filter(t => t.flow_type === 'saida').reduce((s,t)=>s+Number(t.amount),0);
-    const current = Number(a.initial_balance) + entradas - saidas;
-    return { account: a, entradas, saidas, current };
-  });
+  const rows = state.accounts.map(a => accountBalance(a));   // mesma regra usada no Calendário e na Visão Caixa
 
   const totalGeral = rows.reduce((s,r) => s + r.current, 0);
 
