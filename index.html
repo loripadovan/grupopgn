@@ -4845,6 +4845,54 @@ function isTransferTx(t){
     t.categories?.name === 'Transferência Recebida';
 }
 
+/* ============================================================
+   FATURAS DE CARTÃO (linhas virtuais, somente leitura)
+   Soma, por cartão e por mês, as parcelas ainda não pagas e
+   mostra como uma saída prevista no Calendário, nos Lançamentos
+   e na projeção de caixa. Nada é gravado em transactions.
+   Ao marcar as parcelas como pagas, a fatura sai da previsão
+   (evita contar duas vezes junto com o pagamento real no extrato).
+   ============================================================ */
+function addMonthsStr(dateStr, n){
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const total = (y * 12 + (m - 1)) + n;
+  const ny = Math.floor(total / 12), nm = (total % 12) + 1;
+  const last = new Date(ny, nm, 0).getDate();
+  return `${ny}-${String(nm).padStart(2,'0')}-${String(Math.min(d, last)).padStart(2,'0')}`;
+}
+
+function getCardInvoices(){
+  const groups = {};
+  (state.creditCardInstallments || []).forEach(i => {
+    if (i.paid || !i.due_date) return;
+    const tx = state.creditCardTxs.find(t => t.id === i.transaction_id);
+    const card = tx && state.creditCards.find(c => c.id === tx.card_id);
+    if (!card) return;
+    const ym = i.due_date.slice(0, 7);
+    const key = card.id + '|' + ym;
+    if (!groups[key]) {
+      const [y, m] = ym.split('-').map(Number);
+      const last = new Date(y, m, 0).getDate();
+      const day = card.due_day ? Math.min(Number(card.due_day), last) : Number(i.due_date.slice(8, 10));
+      groups[key] = {
+        id: 'card:' + card.id + ':' + ym, _card: true, card_id: card.id,
+        description: 'Fatura ' + card.name, amount: 0, count: 0,
+        flow_type: 'saida', status: 'previsto',
+        date_competencia: `${ym}-${String(day).padStart(2,'0')}`,
+        categories: { name: 'Cartão de crédito' }, account_id: null,
+      };
+    }
+    groups[key].amount += Number(i.amount);
+    groups[key].count++;
+  });
+  return Object.values(groups).map(g => ({ ...g, amount: Math.round(g.amount * 100) / 100 }));
+}
+
+function openTxOrInvoice(t){
+  if (t && t._card) { closeModal(); setPage('cartaocredito'); }
+  else openTransactionModal(t.id);
+}
+
 function computeCashPosition(){
   const today = crmToday();
   const accounts = state.accounts;
@@ -4860,7 +4908,7 @@ function computeCashPosition(){
   }));
   const histBalance = dateStr => initialSum + moves.reduce((s, m) => m.d <= dateStr ? s + m.v : s, 0);
 
-  const pend = state.transactions.filter(t => t.status === 'previsto' && !isTransferTx(t) && t.date_competencia);
+  const pend = state.transactions.concat(getCardInvoices()).filter(t => t.status === 'previsto' && !isTransferTx(t) && t.date_competencia);
   const overduePayList = pend.filter(t => t.flow_type === 'saida'   && t.date_competencia < today);
   const overdueRecList = pend.filter(t => t.flow_type === 'entrada' && t.date_competencia < today);
   const overduePay = overduePayList.reduce((s, t) => s + Number(t.amount), 0);
@@ -5002,7 +5050,7 @@ function renderCalendario(){
     t.categories?.name === 'Transferência Recebida';
 
   // PENDÊNCIAS EM ATRASO — previstos com data anterior a hoje, qualquer mês
-  const overdueTxs = state.transactions.filter(t =>
+  const overdueTxs = state.transactions.concat(getCardInvoices()).filter(t =>
     t.status === 'previsto' &&
     t.date_competencia < todayStr &&
     !isTransfer(t) &&
@@ -5045,7 +5093,7 @@ function renderCalendario(){
             <div style="padding:8px 16px 4px; font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--danger); font-weight:600;">A pagar</div>
             <table style="width:100%;">
               ${overdueTxs.map(t => `
-                <tr onclick="openTransactionModal('${t.id}')" style="cursor:pointer; border-bottom:1px solid var(--border);">
+                <tr onclick="openTxOrInvoice(${t._card ? `{_card:true}` : `{id:'${t.id}'}`})" style="cursor:pointer; border-bottom:1px solid var(--border);">
                   <td style="padding:7px 16px; font-size:12.5px;">${escapeHtml(t.description)}</td>
                   <td style="padding:7px 8px; font-size:11px; color:var(--text-faint);">${t.categories?.name || '—'}</td>
                   <td style="padding:7px 8px; font-size:11px; color:var(--text-faint);">venc. ${formatDate(t.date_competencia)}</td>
@@ -5080,7 +5128,7 @@ function renderCalendario(){
     </div>
   ` : '';
 
-  const monthTxs = state.transactions.filter(t => {
+  const monthTxs = state.transactions.concat(getCardInvoices()).filter(t => {
     if (!t.date_competencia) return false;
     if (isTransfer(t)) return false;
     const [y,m] = t.date_competencia.split('-').map(Number);
@@ -5277,7 +5325,7 @@ function formatMoneyCompact(v){
 }
 
 function openDayDetailModal(dateStr){
-  const items = state.transactions.filter(t => t.date_competencia === dateStr);
+  const items = state.transactions.concat(getCardInvoices()).filter(t => t.date_competencia === dateStr);
   const [y,m,d] = dateStr.split('-');
   const entradasTotal = items.filter(t=>t.flow_type==='entrada').reduce((s,t)=>s+Number(t.amount),0);
   const saidasTotal = items.filter(t=>t.flow_type==='saida').reduce((s,t)=>s+Number(t.amount),0);
@@ -5302,7 +5350,7 @@ function openDayDetailModal(dateStr){
             </div>
           </div>
           ${items.map(t => `
-            <div onclick="closeModal(); openTransactionModal('${t.id}')" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom:1px solid var(--border); cursor:pointer;">
+            <div onclick="${t._card ? `closeModal(); setPage('cartaocredito')` : `closeModal(); openTransactionModal('${t.id}')`}" style="display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom:1px solid var(--border); cursor:pointer;">
               <div style="min-width:0;">
                 <div style="font-size:13.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(t.description)}</div>
                 <div style="display:flex; gap:6px; margin-top:3px;">
@@ -5641,11 +5689,10 @@ async function submitCreditCardTx(editingId){
 
       // gera as parcelas
       const instRows = Array.from({ length: installments }, (_, i) => {
-        const due = new Date(firstDue);
-        due.setMonth(due.getMonth() + i);
+        const dueStr = addMonthsStr(firstDue, i);
         const isLast = i === installments - 1;
         const amt = isLast ? Math.round((amount - installAmt * (installments-1)) * 100)/100 : installAmt;
-        return { transaction_id: tx.id, installment_number: i+1, amount: amt, due_date: due.toISOString().slice(0,10), paid: false };
+        return { transaction_id: tx.id, installment_number: i+1, amount: amt, due_date: dueStr, paid: false };
       });
       const { error: instErr } = await supabaseClient.from('credit_card_installments').insert(instRows);
       if (instErr) throw instErr;
@@ -6071,8 +6118,31 @@ async function submitTransfer(){
   }
 }
 
+function invoicesForPeriod(){
+  const inv = getCardInvoices();
+  if (!state.period) return inv;
+  const { year, month } = state.period;
+  return inv.filter(t => { const [y, m] = t.date_competencia.split('-').map(Number); return y === year && m === month; });
+}
+
+function renderCardInvoiceRow(t){
+  return `
+    <tr style="background:var(--bg-elevated);">
+      <td style="width:34px;"></td>
+      <td onclick="setPage('cartaocredito')" style="cursor:pointer;" title="Fatura calculada a partir da aba Cartão de Crédito">${formatDate(t.date_competencia)}</td>
+      <td onclick="setPage('cartaocredito')" style="cursor:pointer;">
+        <span>💳 ${escapeHtml(t.description)}</span>
+        <span style="font-size:10.5px; color:var(--text-faint); margin-left:6px;">${t.count} parcela${t.count > 1 ? 's' : ''} · automático</span>
+      </td>
+      <td onclick="setPage('cartaocredito')" style="cursor:pointer;"><span class="cat-pill">Cartão de crédito</span></td>
+      <td onclick="setPage('cartaocredito')" style="cursor:pointer;"><span class="status-pill previsto">Previsto</span></td>
+      <td class="amount out" style="text-align:right; cursor:pointer;" onclick="setPage('cartaocredito')">− ${formatMoney(t.amount)}</td>
+    </tr>`;
+}
+
 function renderLancamentos(){
-  const allTxs = filteredTransactions();
+  const allTxs = filteredTransactions().concat(invoicesForPeriod())
+    .sort((a, b) => (b.date_realizado || b.date_competencia).localeCompare(a.date_realizado || a.date_competencia));
 
   // aplica filtros locais
   const f = window._txFilters || {};
@@ -6087,7 +6157,7 @@ function renderLancamentos(){
   });
 
   const selCount = state.selectedTxIds.size;
-  const allChecked = txs.length > 0 && txs.every(t => state.selectedTxIds.has(t.id));
+  const allChecked = txs.some(t => !t._card) && txs.filter(t => !t._card).every(t => state.selectedTxIds.has(t.id));
 
   // categorias e contas únicas para os filtros
   const uniqueCats = [...new Set(allTxs.map(t => t.categories?.name).filter(Boolean))].sort();
@@ -6169,7 +6239,7 @@ function renderLancamentos(){
             <th>Data</th><th>Descrição</th><th>Categoria</th><th>Status</th><th style="text-align:right;">Valor</th>
           </tr></thead>
           <tbody>
-            ${txs.map(t => renderTxRowSelectable(t)).join('')}
+            ${txs.map(t => t._card ? renderCardInvoiceRow(t) : renderTxRowSelectable(t)).join('')}
           </tbody>
         </table>
       `}
