@@ -934,6 +934,9 @@ a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible
           <button class="nav-item" data-page="crm" onclick="setPage('crm')">
             <span class="nav-dot"></span> CRM
           </button>
+          <button class="nav-item" data-page="leadsspe" onclick="setPage('leadsspe')">
+            <span class="nav-dot"></span> Leads SPE
+          </button>
           <button class="nav-item" data-page="faturamento" onclick="setPage('faturamento')">
             <span class="nav-dot"></span> Faturamento
           </button>
@@ -1547,6 +1550,7 @@ function restoreNavGroupStates(){
 
 function setPage(page){
   state.page = page;
+  if (page === 'crm' || page === 'leadsspe') window._crmFilters = {};
   state.selectedTxIds.clear();
   document.querySelectorAll('.nav-item').forEach(el => {
     el.classList.toggle('active', el.dataset.page === page);
@@ -1617,6 +1621,7 @@ const PAGE_TITLES = {
   impostos: 'Controle de Impostos',
   pontoequilibrio: 'Ponto de Equilíbrio',
   crm: 'CRM — Funil Comercial',
+  leadsspe: 'Leads SPE — Funil Comercial',
   faturamento: 'Faturamento',
   clientes: 'Clientes',
   projetos: 'Projetos',
@@ -1664,6 +1669,7 @@ function render(){
     conciliacao: { label: '+ Novo lançamento', action: 'openTransactionModal()' },
     calendario: { label: '+ Novo lançamento', action: 'openTransactionModal()' },
     crm: { label: '+ Novo lead', action: 'openCrmModal()' },
+    leadsspe: { label: '+ Novo lead SPE', action: 'openCrmModal()' },
     projetos: { label: '+ Novo projeto', action: 'openProjectModal()' },
     faturamento: { label: '+ Nova venda/proposta', action: 'openSaleModal()' },
     clientes: { label: '+ Novo cliente', action: 'openClientModal()' },
@@ -1696,6 +1702,7 @@ function render(){
     case 'impostos': content.innerHTML = renderImpostos(); break;
     case 'pontoequilibrio': content.innerHTML = renderPontoEquilibrio(); break;
     case 'crm': content.innerHTML = renderCrm(); break;
+    case 'leadsspe': content.innerHTML = renderCrm(); break;
     case 'faturamento': content.innerHTML = renderFaturamento(); break;
     case 'clientes': content.innerHTML = renderClientes(); break;
     case 'projetos': content.innerHTML = renderProjetos(); break;
@@ -6854,12 +6861,16 @@ function crmAnchorEntityId(){
   return e ? e.id : null;
 }
 
+// Funil atual: a aba "Leads SPE" usa pipeline 'spe'; o CRM geral usa 'geral'.
+function crmPipeline(){ return state.page === 'leadsspe' ? 'spe' : 'geral'; }
+function crmList(){ const pl = crmPipeline(); return state.crmContacts.filter(c => (c.pipeline || 'geral') === pl); }
+
 function crmFiltered(){
   const f = window._crmFilters || {};
   const q = (f.q || '').trim().toLowerCase();
   const qDigits = q.replace(/\D/g, '');
   const today = crmToday();
-  return state.crmContacts.filter(c => {
+  return crmList().filter(c => {
     if (q) {
       const hay = `${c.name || ''} ${c.contact_person || ''}`.toLowerCase();
       const cn = (c.cnpj || '').replace(/\D/g, '');
@@ -6874,7 +6885,7 @@ function crmFiltered(){
 }
 
 function renderCrmSummary(){
-  const all = state.crmContacts;
+  const all = crmList();
   const today = crmToday();
   const novo = all.filter(c => c.status === 'novo').length;
   const andamento = all.filter(c => CRM_OPEN.includes(c.status)).length;
@@ -6911,7 +6922,7 @@ function renderCrmSummary(){
 
 function renderCrmFollowups(){
   const today = crmToday();
-  const due = state.crmContacts
+  const due = crmList()
     .filter(c => c.next_followup && c.next_followup <= today && !CRM_CLOSED.includes(c.status))
     .sort((a, b) => a.next_followup.localeCompare(b.next_followup));
   if (due.length === 0) return '';
@@ -7008,18 +7019,18 @@ function renderCrmFilterInfo(){
   const f = window._crmFilters || {};
   const has = f.q || f.porte || f.month || f.segment || f.overdue;
   if (!has) return '';
-  return `Mostrando <strong>${crmFiltered().length}</strong> de ${state.crmContacts.length} leads`;
+  return `Mostrando <strong>${crmFiltered().length}</strong> de ${crmList().length} leads`;
 }
 
 function renderCrm(){
   const f = window._crmFilters || {};
-  const all = state.crmContacts;
+  const all = crmList();
 
   if (all.length === 0){
     return `
       <div class="empty-state">
-        <div class="empty-state-title">Nenhum lead cadastrado</div>
-        <div>Clique em "+ Novo lead" ou importe a lista dos diagnósticos Sebrae (arquivo import_leads_sebrae.sql).</div>
+        <div class="empty-state-title">${crmPipeline() === 'spe' ? 'Nenhum lead SPE cadastrado' : 'Nenhum lead cadastrado'}</div>
+        <div>${crmPipeline() === 'spe' ? 'Clique em "+ Novo lead SPE" no topo para cadastrar o primeiro. (Se der erro ao salvar, rode antes o arquivo migration_leads_spe.sql no Supabase.)' : 'Clique em "+ Novo lead" ou importe a lista dos diagnósticos Sebrae (arquivo import_leads_sebrae.sql).'}</div>
       </div>`;
   }
 
@@ -7341,6 +7352,7 @@ async function submitCrmContact(editingId){
       const { error } = await supabaseClient.from('crm_contacts').update(payload).eq('id', editingId);
       if (error) throw error;
     } else {
+      payload.pipeline = crmPipeline();
       payload.entity_id = crmAnchorEntityId();
       if (!payload.entity_id) { toast('Nenhuma empresa encontrada para vincular o lead.', 'error'); return; }
       const { data, error } = await supabaseClient.from('crm_contacts').insert(payload).select('id').single();
