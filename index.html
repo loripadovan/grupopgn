@@ -5513,7 +5513,9 @@ function renderCartaoCredito(){
           ${escapeHtml(c.name)}
         </button>
       `).join('')}
-      <button class="btn btn-ghost btn-sm" onclick="openCreditCardModal()" style="margin-left:auto; border:1px solid var(--border);">+ Novo cartão</button>
+      <button class="btn btn-ghost btn-sm" onclick="openCcImportModal()" style="margin-left:auto; border:1px solid var(--border);" title="Importa a fatura do banco (Excel/CSV ou colando as linhas)">📥 Importar fatura</button>
+      <button class="btn btn-ghost btn-sm" onclick="openCcBatchModal()" style="border:1px solid var(--border);" title="Cole várias compras de uma vez">📋 Colar compras em lote</button>
+      <button class="btn btn-ghost btn-sm" onclick="openCreditCardModal()" style="border:1px solid var(--border);">+ Novo cartão</button>
     </div>
 
     ${activeCard ? `
@@ -5549,6 +5551,9 @@ function renderCartaoCredito(){
               <div style="display:flex; align-items:center; gap:12px;">
                 <span style="font-size:12px; color:var(--text-faint);">Pago: ${formatMoney(paidTotal)} de ${formatMoney(monthTotal)}</span>
                 <span class="cat-pill">${byMonth[mKey].length} parcela(s)</span>
+                ${(monthTotal - paidTotal) > 0.004
+                  ? `<button class="btn btn-sm btn-primary ${state.entityKind}" onclick="payCardMonth('${activeCard.id}','${mKey}')">✓ Pagar fatura</button>`
+                  : `<span class="status-pill realizado">Fatura paga</span>`}
               </div>
             </div>
             <table>
@@ -5785,6 +5790,488 @@ async function deleteCreditCardTx(txId){
     await loadCreditCards();
     render();
   } catch (err) { toast('Erro: ' + err.message, 'error'); }
+}
+
+/* ============================================================
+   PAGAR FATURA + LANÇAMENTO EM LOTE (cartão de crédito)
+   ============================================================ */
+async function payCardMonth(cardId, ym){
+  const txIds = state.creditCardTxs.filter(t => t.card_id === cardId).map(t => t.id);
+  const open = state.creditCardInstallments.filter(i => txIds.includes(i.transaction_id) && !i.paid && i.due_date.slice(0, 7) === ym);
+  if (open.length === 0) { toast('Essa fatura já está paga.'); return; }
+  const total = open.reduce((s, i) => s + Number(i.amount), 0);
+  const card = state.creditCards.find(c => c.id === cardId);
+  const [y, m] = ym.split('-');
+  if (!confirm(`Marcar como paga a fatura ${MONTH_NAMES[Number(m) - 1]}/${y} do ${card?.name || 'cartão'}?\n${open.length} parcela(s) · ${formatMoney(total)}\n\nIsso libera o limite e tira a fatura da previsão de caixa.`)) return;
+  try {
+    const { error } = await supabaseClient.from('credit_card_installments')
+      .update({ paid: true, paid_at: new Date().toISOString().slice(0, 10) })
+      .in('id', open.map(i => i.id));
+    if (error) throw error;
+    toast(`Fatura paga: ${formatMoney(total)}.`);
+    await loadCreditCards();
+    render();
+  } catch (err) { toast('Erro ao pagar a fatura: ' + err.message, 'error'); }
+}
+
+function ccParseMoney(v){
+  let t = String(v || '').replace(/R\$|\s/g, '');
+  if (!t) return NaN;
+  if (t.includes(',')) t = t.replace(/\./g, '').replace(',', '.');
+  const n = Number(t);
+  return isFinite(n) ? n : NaN;
+}
+
+// aceita dd/mm/aaaa, dd/mm (ano atual ou o próximo, se já passou), aaaa-mm-dd, mm/aaaa ou aaaa-mm
+function ccParseDate(v, dueDay){
+  const t = String(v || '').trim();
+  if (!t) return null;
+  const pad = n => String(n).padStart(2, '0');
+  const clampDay = (y, m, d) => Math.min(d, new Date(y, m, 0).getDate());
+  let r;
+  if ((r = t.match(/^(\d{4})-(\d{2})-(\d{2})$/))) return t;
+  if ((r = t.match(/^(\d{4})-(\d{2})$/))) return `${r[1]}-${r[2]}-${pad(clampDay(+r[1], +r[2], dueDay || 1))}`;
+  if ((r = t.match(/^(\d{1,2})\/(\d{4})$/))) return `${r[2]}-${pad(+r[1])}-${pad(clampDay(+r[2], +r[1], dueDay || 1))}`;
+  if ((r = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/))) { const y = r[3].length === 2 ? 2000 + +r[3] : +r[3]; return `${y}-${pad(+r[2])}-${pad(clampDay(y, +r[2], +r[1]))}`; }
+  if ((r = t.match(/^(\d{1,2})\/(\d{1,2})$/))) {
+    const now = new Date(); let y = now.getFullYear();
+    const cand = `${y}-${pad(+r[2])}-${pad(clampDay(y, +r[2], +r[1]))}`;
+    if (cand < now.toISOString().slice(0, 10)) y++;
+    return `${y}-${pad(+r[2])}-${pad(clampDay(y, +r[2], +r[1]))}`;
+  }
+  return 'ERRO';
+}
+
+// linhas no formato: descrição ; valor ; parcelas ; 1º vencimento ; categoria   (separador ; ou TAB)
+function ccParseBatch(text, valueIsPerInstallment, defaultYm, dueDay){
+  const defaultDate = ccParseDate(defaultYm, dueDay);
+  return String(text || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean).map((line, idx) => {
+    const f = (line.includes('\t') ? line.split('\t') : line.split(';')).map(x => x.trim());
+    const row = { line: idx + 1, raw: line, desc: f[0] || '', error: null };
+    const val = ccParseMoney(f[1]);
+    const n = f[2] ? parseInt(String(f[2]).replace(/\D/g, ''), 10) : 1;
+    const due = f[3] ? ccParseDate(f[3], dueDay) : defaultDate;
+    row.category = f[4] || null;
+    if (!row.desc) row.error = 'sem descrição';
+    else if (!(val > 0)) row.error = 'valor inválido';
+    else if (!(n >= 1 && n <= 48)) row.error = 'parcelas inválidas (1 a 48)';
+    else if (!due || due === 'ERRO') row.error = 'vencimento inválido';
+    if (!row.error) {
+      row.n = n; row.firstDue = due;
+      row.installAmt = valueIsPerInstallment ? Math.round(val * 100) / 100 : Math.round((val / n) * 100) / 100;
+      row.total = valueIsPerInstallment ? Math.round(val * n * 100) / 100 : Math.round(val * 100) / 100;
+    }
+    return row;
+  });
+}
+
+function openCcBatchModal(){
+  const cards = state.creditCards;
+  if (cards.length === 0) { toast('Cadastre um cartão primeiro.', 'error'); return; }
+  const activeId = window._activeCardId || cards[0].id;
+  const now = new Date();
+  const nm = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  const defYm = `${nm.getFullYear()}-${String(nm.getMonth() + 1).padStart(2, '0')}`;
+  window._ccBatchRows = [];
+  const host = document.getElementById('modal-host');
+  host.innerHTML = `
+    <div class="modal-overlay" id="ccBatchOverlay">
+      <div class="modal" style="max-width:720px; width:94vw;">
+        <div class="modal-header">
+          <div class="modal-title">📋 Lançar compras do cartão em lote</div>
+          <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
+        </div>
+        <div class="modal-body" style="max-height:72vh; overflow:auto;">
+          <div class="field-row">
+            <div class="field">
+              <label for="ccBatchCard">Cartão</label>
+              <select id="ccBatchCard" onchange="ccBatchPreview()">${cards.map(c => `<option value="${c.id}" ${c.id === activeId ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('')}</select>
+            </div>
+            <div class="field">
+              <label for="ccBatchMonth">Mês do 1º vencimento (padrão)</label>
+              <input type="month" id="ccBatchMonth" value="${defYm}" onchange="ccBatchPreview()">
+            </div>
+          </div>
+          <div class="field">
+            <label for="ccBatchMode">O valor de cada linha é…</label>
+            <select id="ccBatchMode" onchange="ccBatchPreview()">
+              <option value="parcela">o valor da PARCELA (como aparece na fatura) — recomendado</option>
+              <option value="total">o valor TOTAL da compra</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="ccBatchText">Compras (uma por linha)</label>
+            <textarea id="ccBatchText" rows="9" placeholder="Supermercado ; 350,90&#10;Notebook (restam 7 de 10) ; 200 ; 7&#10;Curso online ; 99,90 ; 5 ; 10/12/2026 ; Educação" oninput="ccBatchPreview()" style="font-family:monospace; font-size:12.5px;"></textarea>
+            <div style="font-size:11.5px; color:var(--text-faint); margin-top:4px; line-height:1.5;">
+              Formato: <strong>descrição ; valor ; parcelas ; 1º vencimento ; categoria</strong> — só descrição e valor são obrigatórios.
+              Parcelas padrão = 1. Vencimento padrão = o mês acima (no dia de vencimento do cartão). Aceita colar do Excel (colunas separadas por TAB),
+              valores como 1.234,56 e datas como 10/12/2026, 10/12 ou 12/2026.
+              Para compra já em andamento, informe só as parcelas que <strong>restam</strong>.
+            </div>
+          </div>
+          <div id="ccBatchPreview"></div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+          <button class="btn btn-primary ${state.entityKind}" id="ccBatchSubmit" onclick="submitCcBatch()" disabled>Lançar</button>
+        </div>
+      </div>
+    </div>`;
+  document.getElementById('ccBatchOverlay').addEventListener('click', e => { if (e.target.id === 'ccBatchOverlay') closeModal(); });
+}
+
+function ccBatchPreview(){
+  const card = state.creditCards.find(c => c.id === document.getElementById('ccBatchCard').value);
+  const rows = ccParseBatch(
+    document.getElementById('ccBatchText').value,
+    document.getElementById('ccBatchMode').value === 'parcela',
+    document.getElementById('ccBatchMonth').value,
+    card?.due_day ? Number(card.due_day) : null);
+  window._ccBatchRows = rows;
+  const ok = rows.filter(r => !r.error), bad = rows.filter(r => r.error);
+  const totalOk = ok.reduce((s, r) => s + r.total, 0);
+  const first = ok.reduce((s, r) => s + r.installAmt, 0);
+  const host = document.getElementById('ccBatchPreview');
+  document.getElementById('ccBatchSubmit').disabled = ok.length === 0 || bad.length > 0;
+  if (rows.length === 0) { host.innerHTML = ''; return; }
+  host.innerHTML = `
+    <div style="font-size:12px; margin:6px 0;">
+      <strong>${ok.length}</strong> compra(s) válida(s) · total <strong>${formatMoney(totalOk)}</strong> · soma das 1ªs parcelas <strong>${formatMoney(first)}</strong>
+      ${bad.length ? ` · <span style="color:var(--danger); font-weight:700;">${bad.length} linha(s) com erro — corrija para liberar o botão</span>` : ''}
+    </div>
+    <table style="width:100%;">
+      <thead><tr><th>#</th><th>Descrição</th><th style="text-align:right;">Parcela</th><th>Nº</th><th>1º venc.</th><th style="text-align:right;">Total</th></tr></thead>
+      <tbody>${rows.map(r => r.error
+        ? `<tr style="background:var(--danger-soft);"><td>${r.line}</td><td colspan="5" style="font-size:12px;"><span style="color:var(--danger); font-weight:700;">${escapeHtml(r.error)}:</span> ${escapeHtml(r.raw)}</td></tr>`
+        : `<tr><td>${r.line}</td><td style="font-size:12.5px;">${escapeHtml(r.desc)}${r.category ? ` <span class="cat-pill">${escapeHtml(r.category)}</span>` : ''}</td><td class="amount out" style="text-align:right;">${formatMoney(r.installAmt)}</td><td>${r.n}x</td><td>${formatDate(r.firstDue)}</td><td class="amount" style="text-align:right;">${formatMoney(r.total)}</td></tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+async function submitCcBatch(){
+  const rows = (window._ccBatchRows || []).filter(r => !r.error);
+  const cardId = document.getElementById('ccBatchCard').value;
+  if (rows.length === 0) return;
+  const txRows = [], instRows = [];
+  rows.forEach(r => {
+    const id = crypto.randomUUID();
+    txRows.push({ id, card_id: cardId, description: r.desc, total_amount: r.total, installments: r.n, installment_amount: r.installAmt, first_due_date: r.firstDue, category: r.category });
+    for (let i = 0; i < r.n; i++) {
+      const isLast = i === r.n - 1;
+      const amt = isLast ? Math.round((r.total - r.installAmt * (r.n - 1)) * 100) / 100 : r.installAmt;
+      instRows.push({ transaction_id: id, installment_number: i + 1, amount: amt, due_date: addMonthsStr(r.firstDue, i), paid: false });
+    }
+  });
+  const btn = document.getElementById('ccBatchSubmit'); if (btn) btn.disabled = true;
+  try {
+    const { error: e1 } = await supabaseClient.from('credit_card_transactions').insert(txRows);
+    if (e1) throw e1;
+    const { error: e2 } = await supabaseClient.from('credit_card_installments').insert(instRows);
+    if (e2) {   // desfaz as compras para não deixar lançamento sem parcelas
+      await supabaseClient.from('credit_card_transactions').delete().in('id', txRows.map(t => t.id));
+      throw e2;
+    }
+    toast(`${rows.length} compra(s) lançada(s) · ${instRows.length} parcela(s).`);
+    closeModal();
+    await loadCreditCards();
+    render();
+  } catch (err) { toast('Erro ao lançar: ' + err.message, 'error'); if (btn) btn.disabled = false; }
+}
+
+/* ============================================================
+   IMPORTAR FATURA DO CARTÃO (Excel / CSV / colar do Excel)
+   - lê o layout do banco pelos títulos das colunas (Data, Descrição, Parcela, Categoria, Valor)
+   - compra parcelada "k/n" entra com as parcelas que RESTAM (k a n), no valor da parcela
+   - pagamentos e estornos (valor negativo) são ignorados
+   - não duplica: compra/parcela já lançada (mesma descrição + valor + mês) é reconhecida e pulada
+   ============================================================ */
+function ccNorm(s){ return String(s == null ? '' : s).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim(); }
+
+function ccCell(v){
+  if (v == null) return '';
+  if (v instanceof Date) return `${String(v.getDate()).padStart(2,'0')}/${String(v.getMonth()+1).padStart(2,'0')}/${v.getFullYear()}`;
+  return String(v).trim();
+}
+
+function ccSplitLine(line, delim){
+  const out = []; let cur = '', q = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') { if (q && line[i+1] === '"') { cur += '"'; i++; } else q = !q; }
+    else if (ch === delim && !q) { out.push(cur); cur = ''; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out.map(x => x.trim());
+}
+
+function ccTextToGrid(text){
+  const lines = String(text || '').split(/\r?\n/).filter(l => l.trim());
+  if (lines.length === 0) return [];
+  const head = lines.slice(0, 5).join('\n');
+  const cnt = d => (head.match(new RegExp(d === '\t' ? '\t' : '\\' + d, 'g')) || []).length;
+  const delim = ['\t', ';', ','].sort((a, b) => cnt(b) - cnt(a))[0];
+  return lines.map(l => ccSplitLine(l, delim));
+}
+
+// grade (linhas x colunas) -> compras. Procura a linha de títulos nas primeiras 30 linhas.
+function ccGridToItems(grid){
+  let hi = -1, m = {};
+  for (let i = 0; i < Math.min(grid.length, 30); i++) {
+    const h = (grid[i] || []).map(ccNorm);
+    const iDate = h.findIndex(x => /^data/.test(x));
+    const iDesc = h.findIndex(x => /descri|estabelec|historico|lancamento/.test(x));
+    let iVal = h.findIndex(x => /valor/.test(x) && /r\$/.test(x));
+    if (iVal < 0) iVal = h.findIndex(x => /valor/.test(x) && !/us\$|dolar/.test(x));
+    if (iDate >= 0 && iDesc >= 0 && iVal >= 0) {
+      m = { date: iDate, desc: iDesc, val: iVal, parc: h.findIndex(x => /parcela/.test(x)), cat: h.findIndex(x => /categoria/.test(x)) };
+      hi = i; break;
+    }
+  }
+  if (hi < 0) return null;
+  const items = [];
+  for (let i = hi + 1; i < grid.length; i++) {
+    const r = grid[i] || [];
+    const desc = ccCell(r[m.desc]).replace(/\s+/g, ' ').trim();
+    if (!desc && !ccCell(r[m.val])) continue;
+    const value = ccParseMoney(ccCell(r[m.val]));
+    if (!desc || isNaN(value)) continue;
+    const pm = m.parc >= 0 ? ccCell(r[m.parc]).match(/(\d+)\s*(?:\/|de)\s*(\d+)/i) : null;
+    let k = 1, n = 1;
+    if (pm) { k = +pm[1]; n = +pm[2]; if (k > n || n < 1) { k = 1; n = 1; } }
+    const rem = n - k + 1;
+    const kind = value <= 0 ? 'credito' : 'compra';
+    items.push({
+      date: ccCell(r[m.date]), desc, amount: Math.round(Math.abs(value) * 100) / 100, signed: value,
+      k, n, rem, category: m.cat >= 0 ? (ccCell(r[m.cat]) === '-' ? '' : ccCell(r[m.cat])) : '', kind,
+    });
+  }
+  return items;
+}
+
+// mês de vencimento sugerido pelo nome da aba ("15 de Novembro") + datas das compras
+function ccGuessMonth(sheetName, items){
+  const names = ['janeiro','fevereiro','marco','abril','maio','junho','julho','agosto','setembro','outubro','novembro','dezembro'];
+  const mm = ccNorm(sheetName).match(/(\d{1,2})\s*de\s*([a-z]+)/);
+  const mi = mm ? names.indexOf(mm[2]) : -1;
+  if (mi < 0) return null;
+  let maxY = 0, maxM = 0;
+  (items || []).forEach(it => { const d = it.date.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); if (d) { const y = +d[3], mo = +d[2]; if (y > maxY || (y === maxY && mo > maxM)) { maxY = y; maxM = mo; } } });
+  let y = maxY || new Date().getFullYear();
+  if (maxM && (mi + 1) < maxM) y++;
+  return `${y}-${String(mi + 1).padStart(2, '0')}`;
+}
+
+// marca cada compra como 'nova' ou 'existente' (já lançada), por descrição + valor no mês de vencimento
+function ccClassify(items, existing){
+  const pool = {};
+  existing.forEach(e => { const k = ccNorm(e.desc) + '|' + Number(e.amount).toFixed(2); (pool[k] = pool[k] || []).push(e.id); });
+  return items.map(it => {
+    if (it.kind !== 'compra') return { ...it, status: 'ignorada', matchId: null };
+    const k = ccNorm(it.desc) + '|' + it.amount.toFixed(2);
+    if (pool[k] && pool[k].length) return { ...it, status: 'existente', matchId: pool[k].shift() };
+    return { ...it, status: 'nova', matchId: null };
+  });
+}
+
+window._ccImp = { raw: [], items: [], sheet: '' };
+
+function openCcImportModal(){
+  const cards = state.creditCards;
+  if (cards.length === 0) { toast('Cadastre um cartão primeiro.', 'error'); return; }
+  const activeId = window._activeCardId || cards[0].id;
+  const nm = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1);
+  const defYm = `${nm.getFullYear()}-${String(nm.getMonth() + 1).padStart(2, '0')}`;
+  window._ccImp = { raw: [], items: [], sheet: '' };
+  const cats = [...new Set(state.creditCardTxs.map(t => t.category).filter(Boolean))].sort();
+  const host = document.getElementById('modal-host');
+  host.innerHTML = `
+    <div class="modal-overlay" id="ccImpOverlay">
+      <div class="modal" style="max-width:900px; width:96vw;">
+        <div class="modal-header">
+          <div class="modal-title">📥 Importar fatura do cartão</div>
+          <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
+        </div>
+        <div class="modal-body" style="max-height:74vh; overflow:auto;">
+          <datalist id="ccImpCats">${cats.map(c => `<option value="${escapeHtml(c)}">`).join('')}</datalist>
+          <div class="field-row">
+            <div class="field">
+              <label for="ccImpCard">Cartão</label>
+              <select id="ccImpCard" onchange="ccImportPreview()">${cards.map(c => `<option value="${c.id}" ${c.id === activeId ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('')}</select>
+            </div>
+            <div class="field">
+              <label for="ccImpMonth">Mês de vencimento desta fatura</label>
+              <input type="month" id="ccImpMonth" value="${defYm}" onchange="ccImportPreview()">
+            </div>
+          </div>
+          <div class="field">
+            <label>Arquivo da fatura (Excel ou CSV)</label>
+            <input type="file" id="ccImpFile" accept=".xlsx,.xls,.csv,.txt" onchange="ccImportFile(this.files[0])">
+            <div style="font-size:11.5px; color:var(--text-faint); margin-top:4px; line-height:1.5;">
+              Fatura protegida por senha (como a do C6)? Abra no Excel com a senha, selecione tudo (Ctrl+A), copie (Ctrl+C) e cole na caixa abaixo.
+            </div>
+          </div>
+          <div class="field">
+            <label for="ccImpText">…ou cole aqui as linhas copiadas do Excel</label>
+            <textarea id="ccImpText" rows="3" placeholder="Cole aqui (inclua a linha de títulos: Data de compra, Descrição, Parcela, Valor…)" oninput="ccImportFromText()" style="font-family:monospace; font-size:12px;"></textarea>
+          </div>
+          <label style="display:flex; align-items:center; gap:8px; font-size:12.5px; margin:6px 0 10px; cursor:pointer;">
+            <input type="checkbox" id="ccImpPaid" onchange="ccImportPreview()" style="width:15px; height:15px;">
+            Esta fatura <strong>já foi paga</strong> (marca as parcelas deste mês como pagas — só as futuras comprometem o limite)
+          </label>
+          <div id="ccImpMsg"></div>
+          <div id="ccImpPreview"></div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+          <button class="btn btn-primary ${state.entityKind}" id="ccImpSubmit" onclick="submitCcImport()" disabled>Importar</button>
+        </div>
+      </div>
+    </div>`;
+  document.getElementById('ccImpOverlay').addEventListener('click', e => { if (e.target.id === 'ccImpOverlay') closeModal(); });
+}
+
+function ccLoadXlsx(){
+  return new Promise((res, rej) => {
+    if (window.XLSX) return res();
+    const sc = document.createElement('script');
+    sc.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    sc.onload = res;
+    sc.onerror = () => rej(new Error('leitor de Excel indisponível'));
+    document.head.appendChild(sc);
+  });
+}
+
+function ccImpMsg(html, isError){
+  const el = document.getElementById('ccImpMsg');
+  if (el) el.innerHTML = html ? `<div style="padding:8px 10px; border-radius:6px; font-size:12.5px; margin-bottom:8px; background:${isError ? 'var(--danger-soft)' : 'var(--bg-elevated)'}; color:${isError ? 'var(--danger)' : 'var(--text-dim)'};">${html}</div>` : '';
+}
+
+async function ccImportFile(file){
+  if (!file) return;
+  ccImpMsg('');
+  try {
+    let grid, sheetName = '';
+    if (/\.(csv|txt)$/i.test(file.name)) {
+      grid = ccTextToGrid(await file.text());
+    } else {
+      await ccLoadXlsx();
+      const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+      for (const nm of wb.SheetNames) {
+        const g = XLSX.utils.sheet_to_json(wb.Sheets[nm], { header: 1, raw: true, defval: '' });
+        if (ccGridToItems(g)) { grid = g; sheetName = nm; break; }
+      }
+      if (!grid) throw new Error('layout');
+    }
+    ccImportApplyGrid(grid, sheetName);
+  } catch (err) {
+    ccImpMsg('Não consegui ler o arquivo (provavelmente protegido por senha ou em formato diferente). Abra no Excel, selecione tudo (Ctrl+A), copie (Ctrl+C) e cole na caixa abaixo.', true);
+  }
+}
+
+function ccImportFromText(){
+  const grid = ccTextToGrid(document.getElementById('ccImpText').value);
+  if (grid.length === 0) { window._ccImp = { raw: [], items: [], sheet: '' }; ccImportPreview(); return; }
+  ccImportApplyGrid(grid, '');
+}
+
+function ccImportApplyGrid(grid, sheetName){
+  const items = ccGridToItems(grid);
+  if (!items) { ccImpMsg('Não encontrei a linha de títulos (Data, Descrição, Valor). Inclua o cabeçalho ao copiar.', true); window._ccImp = { raw: [], items: [], sheet: '' }; ccImportPreview(); return; }
+  window._ccImp = { raw: items, items: [], sheet: sheetName };
+  const guess = ccGuessMonth(sheetName, items);
+  if (guess) { document.getElementById('ccImpMonth').value = guess; ccImpMsg(`Mês de vencimento sugerido pela aba "${escapeHtml(sheetName)}": ${guess.slice(5)}/${guess.slice(0, 4)} — confira.`); }
+  ccImportPreview();
+}
+
+function ccImportPreview(){
+  const cardId = document.getElementById('ccImpCard').value;
+  const ym = document.getElementById('ccImpMonth').value;
+  const card = state.creditCards.find(c => c.id === cardId);
+  const raw = window._ccImp.raw;
+  const host = document.getElementById('ccImpPreview');
+  const btn = document.getElementById('ccImpSubmit');
+  if (!raw.length || !ym) { host.innerHTML = ''; btn.disabled = true; return; }
+  // preserva categorias já editadas pelo usuário
+  const edited = {}; (window._ccImp.items || []).forEach((it, i) => { edited[i] = it.category; });
+  const txIds = state.creditCardTxs.filter(t => t.card_id === cardId).map(t => t.id);
+  const existing = state.creditCardInstallments
+    .filter(i => txIds.includes(i.transaction_id) && i.due_date.slice(0, 7) === ym)
+    .map(i => ({ id: i.id, amount: i.amount, desc: state.creditCardTxs.find(t => t.id === i.transaction_id)?.description || '' }));
+  const items = ccClassify(raw, existing).map((it, i) => ({ ...it, category: edited[i] !== undefined ? edited[i] : it.category }));
+  window._ccImp.items = items;
+
+  const sum = l => l.reduce((s, x) => s + x.amount, 0);
+  const novas = items.filter(i => i.status === 'nova'), exist = items.filter(i => i.status === 'existente'), ign = items.filter(i => i.status === 'ignorada');
+  const compras = items.filter(i => i.kind === 'compra');
+  const chip = st => st === 'nova' ? '<span class="status-pill previsto">Nova</span>' : st === 'existente' ? '<span class="status-pill realizado">Já lançada</span>' : '<span class="cat-pill">Ignorada</span>';
+  host.innerHTML = `
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:8px; margin:6px 0 10px;">
+      <div class="kpi-card"><div class="kpi-label">Compras na fatura</div><div class="kpi-value" style="color:var(--text); font-size:18px;">${formatMoney(sum(compras))}</div><div class="kpi-sub">${compras.length} lançamento(s) — compare com o app</div></div>
+      <div class="kpi-card"><div class="kpi-label">A importar (novas)</div><div class="kpi-value" style="font-size:18px;">${novas.length}</div><div class="kpi-sub">${formatMoney(sum(novas))} na fatura</div></div>
+      <div class="kpi-card"><div class="kpi-label">Já lançadas</div><div class="kpi-value" style="color:var(--text-dim); font-size:18px;">${exist.length}</div><div class="kpi-sub">puladas (sem duplicar)</div></div>
+      <div class="kpi-card"><div class="kpi-label">Pagamentos/estornos</div><div class="kpi-value" style="color:var(--text-dim); font-size:18px;">${ign.length}</div><div class="kpi-sub">${formatMoney(sum(ign))} ignorados</div></div>
+    </div>
+    <table style="width:100%;">
+      <thead><tr><th>Situação</th><th>Compra</th><th>Descrição</th><th>Parcela</th><th>Categoria</th><th style="text-align:right;">Valor</th></tr></thead>
+      <tbody>${items.map((it, i) => `
+        <tr style="${it.status === 'ignorada' ? 'opacity:.55;' : ''}">
+          <td>${chip(it.status)}</td>
+          <td style="font-size:11.5px; white-space:nowrap;">${escapeHtml(it.date)}</td>
+          <td style="font-size:12.5px;">${escapeHtml(it.desc)}</td>
+          <td style="font-size:11.5px; white-space:nowrap;">${it.n > 1 ? `${it.k}/${it.n}${it.status === 'nova' ? ` <span style="color:var(--text-faint);">(lança ${it.rem})</span>` : ''}` : 'única'}</td>
+          <td>${it.status === 'nova' ? `<input type="text" list="ccImpCats" value="${escapeHtml(it.category)}" oninput="window._ccImp.items[${i}].category = this.value" style="font-size:12px; padding:3px 6px; width:100%; min-width:130px;">` : `<span style="font-size:11.5px; color:var(--text-faint);">${escapeHtml(it.category)}</span>`}</td>
+          <td class="amount ${it.signed < 0 ? 'in' : 'out'}" style="text-align:right; white-space:nowrap;">${it.signed < 0 ? '+' : ''}${formatMoney(it.signed)}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+  btn.disabled = novas.length === 0 && !(document.getElementById('ccImpPaid').checked && exist.length);
+  btn.textContent = novas.length ? `Importar ${novas.length} compra(s)` : 'Importar';
+}
+
+async function submitCcImport(){
+  const cardId = document.getElementById('ccImpCard').value;
+  const ym = document.getElementById('ccImpMonth').value;
+  const paid = document.getElementById('ccImpPaid').checked;
+  const card = state.creditCards.find(c => c.id === cardId);
+  const items = window._ccImp.items || [];
+  const novas = items.filter(i => i.status === 'nova');
+  const exist = items.filter(i => i.status === 'existente' && i.matchId);
+  if (!novas.length && !(paid && exist.length)) return;
+  const [yy, mm] = ym.split('-');
+  const firstDue = ccParseDate(ym, card?.due_day ? Number(card.due_day) : null);
+  const today = new Date().toISOString().slice(0, 10);
+  const txRows = [], instRows = [];
+  novas.forEach(it => {
+    const id = crypto.randomUUID();
+    const total = Math.round(it.amount * it.rem * 100) / 100;
+    txRows.push({
+      id, card_id: cardId, description: it.desc, total_amount: total, installments: it.rem, installment_amount: it.amount,
+      first_due_date: firstDue, category: (it.category || '').trim() || null,
+      notes: `Importado da fatura ${mm}/${yy}${it.n > 1 ? ` · parcela ${it.k}/${it.n} (restam ${it.rem})` : ''}`,
+    });
+    for (let i = 0; i < it.rem; i++) {
+      instRows.push({ transaction_id: id, installment_number: i + 1, amount: it.amount, due_date: addMonthsStr(firstDue, i),
+        paid: paid && i === 0, paid_at: paid && i === 0 ? today : null });
+    }
+  });
+  const btn = document.getElementById('ccImpSubmit'); if (btn) btn.disabled = true;
+  try {
+    if (txRows.length) {
+      const { error: e1 } = await supabaseClient.from('credit_card_transactions').insert(txRows);
+      if (e1) throw e1;
+      const { error: e2 } = await supabaseClient.from('credit_card_installments').insert(instRows);
+      if (e2) { await supabaseClient.from('credit_card_transactions').delete().in('id', txRows.map(t => t.id)); throw e2; }
+    }
+    if (paid && exist.length) {
+      const { error: e3 } = await supabaseClient.from('credit_card_installments').update({ paid: true, paid_at: today }).in('id', exist.map(i => i.matchId));
+      if (e3) throw e3;
+    }
+    toast(`Fatura importada: ${txRows.length} compra(s) nova(s)${paid && exist.length ? ` · ${exist.length} parcela(s) marcada(s) como paga(s)` : ''}.`);
+    closeModal();
+    await loadCreditCards();
+    render();
+  } catch (err) { toast('Erro ao importar: ' + err.message, 'error'); if (btn) btn.disabled = false; }
 }
 
 async function toggleInstallmentPaid(instId, paid){
