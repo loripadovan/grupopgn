@@ -5509,7 +5509,7 @@ function renderCartaoCredito(){
   return `
     <div style="display:flex; gap:8px; align-items:center; margin-bottom:18px; flex-wrap:wrap;">
       ${cards.map(c => `
-        <button class="btn ${c.id === activeCard?.id ? `btn-primary ${state.entityKind}` : 'btn-ghost'} btn-sm" onclick="window._activeCardId='${c.id}'; render();">
+        <button class="btn ${c.id === activeCard?.id ? `btn-primary ${state.entityKind}` : 'btn-ghost'} btn-sm" onclick="window._activeCardId='${c.id}'; window._ccSel = new Set(); render();">
           ${escapeHtml(c.name)}
         </button>
       `).join('')}
@@ -5535,6 +5535,16 @@ function renderCartaoCredito(){
         </div>
       </div>
 
+      ${(window._ccSel && window._ccSel.size) ? `
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:10px 14px; margin-bottom:12px; border:1px solid var(--danger); background:var(--danger-soft); border-radius:var(--radius-sm);">
+          <strong style="font-size:13px;">${window._ccSel.size} compra(s) selecionada(s)</strong>
+          <span style="font-size:11.5px; color:var(--text-dim);">excluir apaga a compra inteira, com todas as parcelas (inclusive de outros meses)</span>
+          <span style="margin-left:auto; display:flex; gap:8px;">
+            <button class="btn btn-ghost btn-sm" onclick="window._ccSel = new Set(); render();">Limpar seleção</button>
+            <button class="btn btn-sm" style="background:var(--danger); border-color:var(--danger); color:#fff;" onclick="deleteSelectedCcTxs()">🗑 Excluir selecionadas</button>
+          </span>
+        </div>` : ''}
+
       ${monthKeys.length === 0 ? `
         <div class="empty-state">
           <div class="empty-state-title">Nenhum gasto lançado</div>
@@ -5557,12 +5567,13 @@ function renderCartaoCredito(){
               </div>
             </div>
             <table>
-              <thead><tr><th>Descrição</th><th>Categoria</th><th>Parcela</th><th>Vencimento</th><th style="text-align:right;">Valor</th><th style="text-align:center;">Pago</th></tr></thead>
+              <thead><tr><th style="width:34px;" onclick="event.stopPropagation();"><input type="checkbox" title="Selecionar todas deste mês" ${byMonth[mKey].every(i => window._ccSel?.has(i.transaction_id)) ? 'checked' : ''} onchange="ccSelectMonth('${mKey}', this.checked)" style="width:15px; height:15px; cursor:pointer;"></th><th>Descrição</th><th>Categoria</th><th>Parcela</th><th>Vencimento</th><th style="text-align:right;">Valor</th><th style="text-align:center;">Pago</th></tr></thead>
               <tbody>
                 ${byMonth[mKey].map(inst => {
                   const tx = txsOfCard.find(t => t.id === inst.transaction_id);
                   return `
-                    <tr style="cursor:pointer;" onclick="openCreditCardTxModal('${tx?.id}')">
+                    <tr style="cursor:pointer;${window._ccSel?.has(tx?.id) ? ' background:var(--danger-soft);' : ''}" onclick="openCreditCardTxModal('${tx?.id}')">
+                      <td style="width:34px;" onclick="event.stopPropagation();"><input type="checkbox" ${window._ccSel?.has(tx?.id) ? 'checked' : ''} onchange="ccToggleSel('${tx?.id}', this.checked)" style="width:15px; height:15px; cursor:pointer;"></td>
                       <td>${escapeHtml(tx?.description || '—')}</td>
                       <td><span class="cat-pill">${escapeHtml(tx?.category || '—')}</span></td>
                       <td style="color:var(--text-faint); font-size:12px;">${inst.installment_number}/${tx?.installments}</td>
@@ -6272,6 +6283,40 @@ async function submitCcImport(){
     await loadCreditCards();
     render();
   } catch (err) { toast('Erro ao importar: ' + err.message, 'error'); if (btn) btn.disabled = false; }
+}
+
+/* seleção múltipla de compras do cartão (para excluir em lote) */
+window._ccSel = new Set();
+
+function ccToggleSel(txId, on){
+  if (!window._ccSel) window._ccSel = new Set();
+  if (on) window._ccSel.add(txId); else window._ccSel.delete(txId);
+  render();
+}
+
+function ccSelectMonth(ym, on){
+  const cardId = window._activeCardId || state.creditCards[0]?.id;
+  const txIds = state.creditCardTxs.filter(t => t.card_id === cardId).map(t => t.id);
+  state.creditCardInstallments
+    .filter(i => txIds.includes(i.transaction_id) && i.due_date.slice(0, 7) === ym)
+    .forEach(i => { if (on) window._ccSel.add(i.transaction_id); else window._ccSel.delete(i.transaction_id); });
+  render();
+}
+
+async function deleteSelectedCcTxs(){
+  const ids = [...(window._ccSel || [])];
+  if (ids.length === 0) return;
+  const insts = state.creditCardInstallments.filter(i => ids.includes(i.transaction_id));
+  const total = insts.reduce((s, i) => s + Number(i.amount), 0);
+  if (!confirm(`Excluir ${ids.length} compra(s) e as ${insts.length} parcela(s) delas (${formatMoney(total)})?\n\nIsso não pode ser desfeito.`)) return;
+  try {
+    const { error } = await supabaseClient.from('credit_card_transactions').delete().in('id', ids);
+    if (error) throw error;
+    window._ccSel = new Set();
+    toast(`${ids.length} compra(s) excluída(s).`);
+    await loadCreditCards();
+    render();
+  } catch (err) { toast('Erro ao excluir: ' + err.message, 'error'); }
 }
 
 async function toggleInstallmentPaid(instId, paid){
