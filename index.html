@@ -4900,8 +4900,13 @@ function openTxOrInvoice(t){
   else openTransactionModal(t.id);
 }
 
+// Janela da projeção de caixa (dias à frente). Previstos além dela não entram no alerta.
+const CASH_HORIZON_DAYS = 90;
+
 function computeCashPosition(){
   const today = crmToday();
+  const lim = new Date(today + 'T12:00:00'); lim.setDate(lim.getDate() + CASH_HORIZON_DAYS);
+  const horizonLimit = crmDateStr(lim);
   const accounts = state.accounts;
   const saldoHoje = accounts.reduce((s, a) => s + accountBalance(a).current, 0);
   const initialSum = accounts.reduce((s, a) => s + Number(a.initial_balance), 0);
@@ -4923,7 +4928,7 @@ function computeCashPosition(){
   const base = saldoHoje - overduePay;   // caixa de hoje depois de quitar os atrasos a pagar
 
   const byDate = {};
-  pend.filter(t => t.date_competencia >= today).forEach(t => {
+  pend.filter(t => t.date_competencia >= today && t.date_competencia <= horizonLimit).forEach(t => {
     byDate[t.date_competencia] = (byDate[t.date_competencia] || 0) + (t.flow_type === 'entrada' ? 1 : -1) * Number(t.amount);
   });
   const dates = Object.keys(byDate).sort();
@@ -4949,7 +4954,65 @@ function computeCashPosition(){
     horizonEnd: dates.length ? dates[dates.length - 1] : today,
     hasFuture: dates.length > 0,
     balanceOn,
+    overdueItems: overduePayList,
+    overdueRecItems: overdueRecList,
+    futureItems: pend.filter(t => t.date_competencia >= today && t.date_competencia <= horizonLimit),
+    horizonLimit,
   };
+}
+
+function openCashBreakdown(){
+  const cp = computeCashPosition();
+  const upTo = cp.minPoint.date;
+  const sgn = t => (t.flow_type === 'entrada' ? 1 : -1) * Number(t.amount);
+  const future = cp.futureItems.filter(t => t.date_competencia <= upTo)
+    .sort((a, b) => a.date_competencia.localeCompare(b.date_competencia) || sgn(a) - sgn(b));
+  const ent = future.filter(t => t.flow_type === 'entrada').reduce((s, t) => s + Number(t.amount), 0);
+  const sai = future.filter(t => t.flow_type === 'saida').reduce((s, t) => s + Number(t.amount), 0);
+  const overdue = cp.overdueItems.slice().sort((a, b) => Number(b.amount) - Number(a.amount));
+  const click = t => t._card ? `setPage('cartaocredito'); closeModal();` : `closeModal(); openTransactionModal('${t.id}')`;
+  const line = (t, bal) => `
+    <tr onclick="${click(t)}" style="cursor:pointer; border-bottom:1px solid var(--border);">
+      <td style="padding:6px 8px; font-size:11.5px; white-space:nowrap;">${formatDate(t.date_competencia)}</td>
+      <td style="padding:6px 8px; font-size:12.5px;">${t._card ? '💳 ' : ''}${escapeHtml(t.description)}${t._card ? ` <span style="font-size:10.5px; color:var(--text-faint);">(${t.count} parcela${t.count > 1 ? 's' : ''})</span>` : ''}</td>
+      <td class="amount ${t.flow_type === 'entrada' ? 'in' : 'out'}" style="padding:6px 8px; text-align:right; white-space:nowrap;">${t.flow_type === 'entrada' ? '+' : '−'} ${formatMoney(t.amount)}</td>
+      <td style="padding:6px 8px; text-align:right; font-size:11.5px; white-space:nowrap; color:${bal >= 0 ? 'var(--text-dim)' : 'var(--danger)'};">${bal == null ? '' : formatMoney(bal)}</td>
+    </tr>`;
+  let run = cp.base;
+  const futureRows = future.map(t => { run += sgn(t); return line(t, run); }).join('');
+  const kv = (k, v, c) => `<div style="display:flex; justify-content:space-between; gap:12px; padding:3px 0; font-size:12.5px;"><span style="color:var(--text-dim);">${k}</span><strong style="color:${c || 'var(--text)'};">${v}</strong></div>`;
+
+  const host = document.getElementById('modal-host');
+  host.innerHTML = `
+    <div class="modal-overlay" id="cashBreakdownOverlay">
+      <div class="modal" style="max-width:760px; width:94vw;">
+        <div class="modal-header">
+          <div class="modal-title">Composição do menor saldo — ${formatDate(upTo)}</div>
+          <button class="btn btn-ghost btn-sm" onclick="closeModal()">✕</button>
+        </div>
+        <div class="modal-body" style="padding-top:6px; max-height:70vh; overflow:auto;">
+          <div style="padding:6px 0 12px; border-bottom:1px solid var(--border);">
+            ${kv('Saldo em caixa hoje', formatMoney(cp.saldoHoje), cp.saldoHoje >= 0 ? 'var(--pj)' : 'var(--danger)')}
+            ${kv(`(−) Atrasos a pagar (${overdue.length})`, formatMoney(cp.overduePay), 'var(--danger)')}
+            ${kv('= Caixa após quitar atrasos', formatMoney(cp.base), cp.base >= 0 ? 'var(--text)' : 'var(--danger)')}
+            ${kv(`(+) Entradas previstas até ${formatDate(upTo)}`, formatMoney(ent), 'var(--pj)')}
+            ${kv(`(−) Saídas previstas até ${formatDate(upTo)} (${future.filter(t => t.flow_type === 'saida').length})`, formatMoney(sai), 'var(--danger)')}
+            ${kv('= Menor saldo projetado', formatMoney(cp.minPoint.balance), cp.minPoint.balance >= 0 ? 'var(--pj)' : 'var(--danger)')}
+          </div>
+
+          <div style="font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; font-weight:700; color:var(--danger); margin:14px 0 4px;">Atrasos a pagar (maiores primeiro)</div>
+          ${overdue.length === 0 ? '<div style="font-size:12px; color:var(--text-faint);">Nenhum.</div>' : `
+          <table style="width:100%;">${overdue.map(t => line(t, null)).join('')}</table>`}
+
+          <div style="font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; font-weight:700; color:var(--text-faint); margin:16px 0 4px;">Previstos de hoje até ${formatDate(upTo)} (com saldo acumulado)</div>
+          ${future.length === 0 ? '<div style="font-size:12px; color:var(--text-faint);">Nenhum lançamento previsto neste intervalo.</div>' : `
+          <table style="width:100%;">${futureRows}</table>`}
+          <div style="font-size:11px; color:var(--text-faint); margin-top:12px;">Atrasos a receber (${cp.overdueRecCount}, ${formatMoney(cp.overdueRec)}) ficam fora da projeção até você dar baixa. 💳 = fatura de cartão calculada pela aba Cartão de Crédito.</div>
+        </div>
+        <div class="modal-footer"><button class="btn btn-ghost" onclick="closeModal()">Fechar</button></div>
+      </div>
+    </div>`;
+  document.getElementById('cashBreakdownOverlay').addEventListener('click', e => { if (e.target.id === 'cashBreakdownOverlay') closeModal(); });
 }
 
 function calendarGoToDate(dateStr){
@@ -4978,13 +5041,13 @@ function renderCashCard(cp){
         ${neg.date === cp.today ? '' : `${n === 1 ? 'amanhã' : `em ${n} dias`} · `}saldo de <strong style="color:var(--danger);">${formatMoney(neg.balance)}</strong> nesse dia
       </div>
       <div style="font-size:12px; color:var(--text-dim); margin-top:3px;">
-        Menor saldo: <strong style="color:var(--danger);">${formatMoney(cp.minPoint.balance)}</strong> em ${fmtD(cp.minPoint.date)}
+        Menor saldo: <strong style="color:var(--danger);">${formatMoney(cp.minPoint.balance)}</strong> em ${formatDate(cp.minPoint.date)}
         · <strong>faltam ${formatMoney(needed)}</strong> para cobrir
       </div>
       <button class="btn btn-ghost btn-sm" onclick="calendarGoToDate('${neg.date}')" style="margin-top:8px; border:1px solid var(--danger); color:var(--danger);">Ver no calendário →</button>`;
   } else if (cp.hasFuture) {
     projection = `
-      <div style="font-weight:700; font-size:14px; color:var(--pj);">✓ Sem falta de caixa até ${formatDate(cp.horizonEnd)}</div>
+      <div style="font-weight:700; font-size:14px; color:var(--pj);">✓ Sem falta de caixa nos próximos ${CASH_HORIZON_DAYS} dias</div>
       <div style="font-size:12px; color:var(--text-dim); margin-top:3px;">
         Menor saldo projetado: <strong>${formatMoney(cp.minPoint.balance)}</strong> em ${cp.minPoint.date === cp.today ? 'hoje' : fmtD(cp.minPoint.date)}
       </div>`;
@@ -5013,10 +5076,11 @@ function renderCashCard(cp){
         <div style="${cell} border-left:1px solid var(--border);">
           <div style="font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; font-weight:700; color:var(--text-faint); margin-bottom:6px;">Projeção do caixa</div>
           ${projection}
+          <button class="btn btn-ghost btn-sm" onclick="openCashBreakdown()" style="margin-top:8px; border:1px solid var(--border);">🔍 Ver composição</button>
         </div>
       </div>
       <div style="padding:8px 18px; border-top:1px solid var(--border); font-size:11px; color:var(--text-faint); background:var(--bg-elevated);">
-        Considera os lançamentos previstos já cadastrados${cp.hasFuture ? ` (até ${formatDate(cp.horizonEnd)})` : ''}. Atrasos a pagar entram como pagos hoje; atrasos a receber só entram quando você der baixa. Despesas ainda não lançadas não aparecem aqui.
+        Considera os lançamentos previstos dos próximos ${CASH_HORIZON_DAYS} dias (até ${formatDate(cp.horizonLimit)}). Atrasos a pagar entram como pagos hoje; atrasos a receber só entram quando você der baixa. Despesas ainda não lançadas não aparecem aqui.
       </div>
     </div>
   `;
